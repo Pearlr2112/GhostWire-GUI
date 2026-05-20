@@ -1,15 +1,53 @@
 """
-GhostWire – secure Morse-code messaging desktop app
+GhostWire – multi-user secure Morse-code messaging app
+Powered by Supabase for real-time messaging and invite-code contacts.
+
+NOTE: Do not commit SUPABASE_KEY to public repositories.
 """
 
 import os
 import hashlib
-import sqlite3
 import base64
 import time
+import random
+import string
+import threading
 import tkinter as tk
 from tkinter import messagebox
-from cryptography.fernet import Fernet
+
+# ── Supabase (REST only, no extra SDK needed) ─────────────────────────────────
+import urllib.request
+import urllib.parse
+import json
+
+SUPABASE_URL = "https://ovntepipcokcpccamybx.supabase.co"
+SUPABASE_KEY = "sb_publishable_GhhQaMSEYQUTLxfr4Y_enA_Nd1ce-7A"
+
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation",
+}
+
+
+def sb_request(method: str, path: str, data: dict = None, params: dict = None) -> list | dict | None:
+    url = SUPABASE_URL + "/rest/v1/" + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    body = json.dumps(data).encode() if data else None
+    req = urllib.request.Request(url, data=body, headers=HEADERS, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else []
+    except urllib.error.HTTPError as e:
+        print(f"[Supabase] {method} {path} → {e.code}: {e.read().decode()}")
+        return None
+    except Exception as e:
+        print(f"[Supabase] {method} {path} → {e}")
+        return None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Morse utilities
@@ -37,69 +75,135 @@ def to_morse(text: str) -> str:
 
 
 def from_morse(morse: str) -> str:
+    """Convert morse string back to text. Handles empty input gracefully."""
+    if not morse or not morse.strip():
+        return ''
     words = morse.strip().split(' / ')
-    decoded = []
-    for word in words:
-        letters = [REVERSE_MORSE.get(code, '?') for code in word.strip().split()]
-        decoded.append(''.join(letters))
-    return ' '.join(decoded)
+    return ' '.join(''.join(REVERSE_MORSE.get(c, '?') for c in w.split()) for w in words)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Database & authentication
+#  Auth helpers (Supabase-backed)
 # ──────────────────────────────────────────────────────────────────────────────
 
-DB_PATH = os.path.join(os.path.expanduser('~'), 'ghostwire_accounts.sqlite')
-
-
-def derive_key(password: str) -> Fernet:
-    key = hashlib.sha256(password.encode()).digest()
-    return Fernet(base64.urlsafe_b64encode(key))
-
-
-def setup_database() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                user     TEXT UNIQUE,
-                password TEXT,
-                salt     BLOB
-            )
-        """)
-        conn.commit()
+def _hash_password(password: str, salt: bytes) -> str:
+    return hashlib.sha3_512(salt + password.encode()).hexdigest()
 
 
 def db_register(username: str, password: str) -> tuple[bool, str]:
     salt = os.urandom(16)
-    hashed = hashlib.sha3_512(salt + password.encode()).hexdigest()
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "INSERT INTO users (user, password, salt) VALUES (?, ?, ?)",
-                (username, hashed, salt),
-            )
-            conn.commit()
-        return True, ''
-    except sqlite3.IntegrityError:
-        return False, 'Username already exists.'
+    hashed = _hash_password(password, salt)
+    result = sb_request("POST", "users", {
+        "username": username,
+        "password_hash": hashed,
+        "salt": base64.b64encode(salt).decode(),
+    })
+    if result is None:
+        return False, "Username already exists or server error."
+    return True, result[0]["id"] if isinstance(result, list) else result.get("id", "")
 
 
 def db_login(username: str, password: str) -> tuple[bool, str]:
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT password, salt FROM users WHERE user = ?", (username,)
-        ).fetchone()
-    if not row:
-        return False, 'User not found.'
-    stored_pw, salt = row
-    if hashlib.sha3_512(salt + password.encode()).hexdigest() == stored_pw:
-        return True, ''
-    return False, 'Incorrect password.'
+    rows = sb_request("GET", "users", params={"username": f"eq.{username}", "select": "id,password_hash,salt"})
+    if not rows:
+        return False, "User not found."
+    row = rows[0]
+    salt = base64.b64decode(row["salt"])
+    if _hash_password(password, salt) == row["password_hash"]:
+        return True, row["id"]
+    return False, "Incorrect password."
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Colour palette  (deep navy, no white)
+#  Invite code helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_invite_code(user_id: str) -> str:
+    code = "GW-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    sb_request("POST", "invite_codes", {
+        "code": code,
+        "created_by": user_id,
+        "used": False,
+    })
+    return code
+
+
+def redeem_invite_code(code: str, my_user_id: str) -> tuple[bool, str]:
+    rows = sb_request("GET", "invite_codes", params={
+        "code": f"eq.{code}",
+        "used": "eq.false",
+        "select": "code,created_by",
+    })
+    if not rows:
+        return False, "Invalid or already-used code."
+    row = rows[0]
+    their_id = row["created_by"]
+    if their_id == my_user_id:
+        return False, "You can't add yourself."
+
+    # Mark code as used
+    sb_request("PATCH", f"invite_codes?code=eq.{code}", {"used": True})
+
+    # Look up their username
+    user_rows = sb_request("GET", "users", params={"id": f"eq.{their_id}", "select": "username"})
+    their_name = user_rows[0]["username"] if user_rows else "Unknown"
+
+    # Create contact relationship (both directions)
+    sb_request("POST", "contacts", {"user_id": my_user_id, "contact_id": their_id})
+    sb_request("POST", "contacts", {"user_id": their_id,   "contact_id": my_user_id})
+
+    return True, their_name
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Messaging helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def fetch_contacts(user_id: str) -> list[dict]:
+    rows = sb_request("GET", "contacts", params={
+        "user_id": f"eq.{user_id}",
+        "select": "contact_id",
+    })
+    if not rows:
+        return []
+    contacts = []
+    for r in rows:
+        cid = r["contact_id"]
+        user_rows = sb_request("GET", "users", params={"id": f"eq.{cid}", "select": "id,username"})
+        if user_rows:
+            u = user_rows[0]
+            initials = "".join(w[0].upper() for w in u["username"].split()[:2]) or u["username"][:2].upper()
+            contacts.append({"id": cid, "name": u["username"], "initials": initials})
+    return contacts
+
+
+def fetch_messages(my_id: str, their_id: str) -> list[dict]:
+    rows = sb_request("GET", "messages", params={
+        "or": f"(and(sender_id.eq.{my_id},receiver_id.eq.{their_id}),and(sender_id.eq.{their_id},receiver_id.eq.{my_id}))",
+        "order": "created_at.asc",
+        "select": "sender_id,morse,original,created_at",
+    })
+    if not rows:
+        return []
+    result = []
+    for r in rows:
+        side = "sent" if r["sender_id"] == my_id else "recv"
+        result.append({"side": side, "morse": r["morse"], "original": r["original"]})
+    return result
+
+
+def send_message(sender_id: str, receiver_id: str, morse: str, original: str) -> bool:
+    result = sb_request("POST", "messages", {
+        "sender_id": sender_id,
+        "receiver_id": receiver_id,
+        "morse": morse,
+        "original": original,
+    })
+    return result is not None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Colour palette
 # ──────────────────────────────────────────────────────────────────────────────
 
 BG_DARK      = '#0b0d14'
@@ -113,7 +217,6 @@ BG_ACTIVE    = '#1e2038'
 
 ACCENT       = '#7c6af7'
 ACCENT_HOVER = '#9182ff'
-ACCENT_DIM   = '#3d3578'
 
 TEAL         = '#2dd4a0'
 TEAL_DARK    = '#163d2e'
@@ -130,6 +233,8 @@ BORDER_LIGHT = '#2e3152'
 RED_ERR      = '#e05c6a'
 GREEN_OK     = '#2dd4a0'
 
+CONTACT_COLORS = ['#7c6af7', '#2dd4a0', '#c45c8a', '#d4893a', '#4a90d9', '#c0a030']
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Widget helpers
@@ -137,16 +242,10 @@ GREEN_OK     = '#2dd4a0'
 
 def make_entry(parent, textvariable, show=None):
     return tk.Entry(
-        parent,
-        textvariable=textvariable,
-        show=show,
-        font=('Helvetica', 12),
-        bg=BG_INPUT,
-        fg=TEXT_PRI,
-        insertbackground=ACCENT,
-        relief='flat',
-        highlightthickness=1,
-        highlightbackground=BORDER_LIGHT,
+        parent, textvariable=textvariable, show=show,
+        font=('Helvetica', 12), bg=BG_INPUT, fg=TEXT_PRI,
+        insertbackground=ACCENT, relief='flat',
+        highlightthickness=1, highlightbackground=BORDER_LIGHT,
         highlightcolor=ACCENT,
     )
 
@@ -157,10 +256,8 @@ def make_btn(parent, text, command, fg='#d6d3e8', bg=ACCENT, hover=ACCENT_HOVER,
     btn = tk.Button(
         parent, text=text, command=command,
         font=('Helvetica', font_size, weight),
-        bg=bg, fg=fg,
-        activebackground=hover, activeforeground=fg,
-        relief='flat', cursor='hand2',
-        padx=padx, pady=pady, bd=0,
+        bg=bg, fg=fg, activebackground=hover, activeforeground=fg,
+        relief='flat', cursor='hand2', padx=padx, pady=pady, bd=0,
     )
     btn.bind('<Enter>', lambda e: btn.config(bg=hover))
     btn.bind('<Leave>', lambda e: btn.config(bg=bg))
@@ -191,7 +288,6 @@ class AuthScreen(tk.Frame):
                         highlightthickness=1, highlightbackground=BORDER_LIGHT)
         card.place(relx=0.5, rely=0.5, anchor='center', width=400)
 
-        # Logo
         logo = tk.Frame(card, bg=BG_PANEL, pady=30)
         logo.pack(fill='x')
         tk.Label(logo, text='◉', font=('Courier', 30, 'bold'),
@@ -203,7 +299,6 @@ class AuthScreen(tk.Frame):
 
         divider(card).pack(fill='x')
 
-        # Tabs
         tabs = tk.Frame(card, bg=BG_CARD)
         tabs.pack(fill='x')
         tabs.grid_columnconfigure(0, weight=1)
@@ -211,23 +306,20 @@ class AuthScreen(tk.Frame):
 
         self._tab_login = tk.Button(
             tabs, text='Login', font=('Helvetica', 10, 'bold'),
-            bg=ACCENT, fg='#d6d3e8',
-            activebackground=ACCENT_HOVER, activeforeground='#d6d3e8',
+            bg=ACCENT, fg='#d6d3e8', activebackground=ACCENT_HOVER,
             relief='flat', cursor='hand2', pady=10,
             command=lambda: self._switch('login'))
         self._tab_login.grid(row=0, column=0, sticky='ew')
 
         self._tab_reg = tk.Button(
             tabs, text='Register', font=('Helvetica', 10, 'bold'),
-            bg=BG_CARD, fg=TEXT_SEC,
-            activebackground=BG_HOVER, activeforeground=TEXT_PRI,
+            bg=BG_CARD, fg=TEXT_SEC, activebackground=BG_HOVER,
             relief='flat', cursor='hand2', pady=10,
             command=lambda: self._switch('register'))
         self._tab_reg.grid(row=0, column=1, sticky='ew')
 
         divider(card).pack(fill='x')
 
-        # Form
         form = tk.Frame(card, bg=BG_PANEL, padx=36, pady=28)
         form.pack(fill='x')
 
@@ -243,7 +335,6 @@ class AuthScreen(tk.Frame):
         self._pw_entry = make_entry(form, self._pw_var, show='●')
         self._pw_entry.pack(fill='x', ipady=8, pady=(3, 0))
 
-        # Confirm password (register only)
         self._confirm_frame = tk.Frame(form, bg=BG_PANEL)
         self._confirm_frame.pack(fill='x')
         tk.Label(self._confirm_frame, text='Confirm Password', font=('Helvetica', 9),
@@ -253,7 +344,6 @@ class AuthScreen(tk.Frame):
                    show='●').pack(fill='x', ipady=8, pady=(3, 0))
         self._confirm_frame.pack_forget()
 
-        # Status
         self._status_var = tk.StringVar()
         self._status_lbl = tk.Label(
             form, textvariable=self._status_var,
@@ -261,9 +351,7 @@ class AuthScreen(tk.Frame):
             wraplength=310, justify='left')
         self._status_lbl.pack(anchor='w', pady=(12, 0))
 
-        # Submit
-        self._submit_btn = make_btn(form, 'Login  →', self._submit,
-                                     font_size=11, pady=10)
+        self._submit_btn = make_btn(form, 'Login  →', self._submit, font_size=11, pady=10)
         self._submit_btn.pack(fill='x', pady=(14, 4))
 
         self.master.bind('<Return>', lambda e: self._submit())
@@ -289,36 +377,134 @@ class AuthScreen(tk.Frame):
         if not username or not password:
             self._set_status('Please fill in all fields.', error=True)
             return
+        self._submit_btn.config(state='disabled', text='Please wait…')
+        self.update()
         if self._mode == 'register':
-            confirm = self._confirm_var.get()
-            if password != confirm:
+            if password != self._confirm_var.get():
                 self._set_status('Passwords do not match.', error=True)
+                self._submit_btn.config(state='normal', text='Create Account  →')
                 return
             if len(password) < 6:
                 self._set_status('Password must be at least 6 characters.', error=True)
+                self._submit_btn.config(state='normal', text='Create Account  →')
                 return
-            ok, msg = db_register(username, password)
+            ok, result = db_register(username, password)
             if ok:
                 self._set_status('Account created! Logging you in…', error=False)
-                self.after(800, lambda: self._launch(username, password))
+                self.after(800, lambda: self._launch(username, result))
             else:
-                self._set_status(msg, error=True)
+                self._set_status(result, error=True)
+                self._submit_btn.config(state='normal', text='Create Account  →')
         else:
-            ok, msg = db_login(username, password)
+            ok, result = db_login(username, password)
             if ok:
                 self._set_status(f'Welcome back, {username}!', error=False)
-                self.after(500, lambda: self._launch(username, password))
+                self.after(500, lambda: self._launch(username, result))
             else:
-                self._set_status(msg, error=True)
+                self._set_status(result, error=True)
+                self._submit_btn.config(state='normal', text='Login  →')
 
     def _set_status(self, msg: str, error: bool = True) -> None:
         self._status_var.set(msg)
         self._status_lbl.config(fg=RED_ERR if error else GREEN_OK)
 
-    def _launch(self, username: str, password: str) -> None:
+    def _launch(self, username: str, user_id: str) -> None:
         self.master.unbind('<Return>')
         self.destroy()
-        self.on_success(username, password)
+        self.on_success(username, user_id)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Invite code dialog
+# ──────────────────────────────────────────────────────────────────────────────
+
+class InviteDialog(tk.Toplevel):
+
+    def __init__(self, master, user_id: str, on_contact_added):
+        super().__init__(master)
+        self.title('Add Contact')
+        self.configure(bg=BG_PANEL)
+        self.resizable(False, False)
+        self.grab_set()
+        self._user_id = user_id
+        self._on_contact_added = on_contact_added
+        self._build()
+        self.geometry('440x380')
+
+    def _build(self):
+        pad = tk.Frame(self, bg=BG_PANEL, padx=30, pady=24)
+        pad.pack(fill='both', expand=True)
+
+        tk.Label(pad, text='Add Contact', font=('Helvetica', 14, 'bold'),
+                 bg=BG_PANEL, fg=TEXT_PRI).pack(anchor='w')
+        tk.Label(pad, text="Share your code or enter a friend's code",
+                 font=('Helvetica', 9), bg=BG_PANEL, fg=TEXT_SEC).pack(anchor='w', pady=(2, 16))
+
+        divider(pad).pack(fill='x', pady=(0, 16))
+
+        # My code section
+        tk.Label(pad, text='YOUR INVITE CODE', font=('Helvetica', 8, 'bold'),
+                 bg=BG_PANEL, fg=TEXT_MORSE).pack(anchor='w')
+
+        code_row = tk.Frame(pad, bg=BG_PANEL)
+        code_row.pack(fill='x', pady=(4, 0))
+
+        self._my_code_var = tk.StringVar(value='Click Generate to get a code')
+        code_lbl = tk.Label(code_row, textvariable=self._my_code_var,
+                             font=('Courier', 13, 'bold'), bg=BG_CARD, fg=ACCENT,
+                             padx=12, pady=10, anchor='w')
+        code_lbl.pack(side='left', fill='x', expand=True)
+
+        gen_btn = make_btn(code_row, 'Generate', self._generate,
+                           font_size=9, padx=10, pady=10)
+        gen_btn.pack(side='right', padx=(8, 0))
+
+        tk.Label(pad, text='Share this code once — it deletes after use.',
+                 font=('Helvetica', 8), bg=BG_PANEL, fg=TEXT_MORSE).pack(anchor='w', pady=(4, 20))
+
+        divider(pad).pack(fill='x', pady=(0, 16))
+
+        # Enter a code
+        tk.Label(pad, text="ENTER A FRIEND'S CODE", font=('Helvetica', 8, 'bold'),
+                 bg=BG_PANEL, fg=TEXT_MORSE).pack(anchor='w')
+
+        enter_row = tk.Frame(pad, bg=BG_PANEL)
+        enter_row.pack(fill='x', pady=(4, 0))
+        enter_row.grid_columnconfigure(0, weight=1)
+
+        self._code_var = tk.StringVar()
+        code_entry = make_entry(enter_row, self._code_var)
+        code_entry.grid(row=0, column=0, sticky='ew', ipady=8, padx=(0, 8))
+        code_entry.bind('<Return>', lambda e: self._redeem())
+
+        make_btn(enter_row, 'Add', self._redeem,
+                 font_size=9, padx=14, pady=8).grid(row=0, column=1)
+
+        self._status_var = tk.StringVar()
+        self._status_lbl = tk.Label(pad, textvariable=self._status_var,
+                                     font=('Helvetica', 9), bg=BG_PANEL, fg=RED_ERR,
+                                     wraplength=360)
+        self._status_lbl.pack(anchor='w', pady=(10, 0))
+
+    def _generate(self):
+        code = generate_invite_code(self._user_id)
+        self._my_code_var.set(code)
+
+    def _redeem(self):
+        code = self._code_var.get().strip().upper()
+        if not code:
+            return
+        self._status_var.set('Connecting…')
+        self._status_lbl.config(fg=TEXT_SEC)
+        self.update()
+        ok, result = redeem_invite_code(code, self._user_id)
+        if ok:
+            self._status_var.set(f'Added {result}!')
+            self._status_lbl.config(fg=GREEN_OK)
+            self.after(1000, lambda: (self._on_contact_added(), self.destroy()))
+        else:
+            self._status_var.set(result)
+            self._status_lbl.config(fg=RED_ERR)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -334,29 +520,78 @@ class MorseChatApp(tk.Tk):
         self.minsize(720, 520)
         self.configure(bg=BG_DARK)
         self.resizable(True, True)
-
-        setup_database()
+        self._poll_job = None
         AuthScreen(self, self._on_login)
 
-    def _on_login(self, username: str, password: str) -> None:
+    def _on_login(self, username: str, user_id: str) -> None:
         self._username = username
-        self._fernet   = derive_key(password)
-
-        self.contacts = [
-            {'name': 'Alex K.',   'initials': 'AK', 'online': True,  'color': ACCENT},
-            {'name': 'Sam R.',    'initials': 'SR', 'online': True,  'color': TEAL},
-            {'name': 'Jordan T.', 'initials': 'JT', 'online': False, 'color': '#c45c8a'},
-            {'name': 'Morgan B.', 'initials': 'MB', 'online': True,  'color': '#d4893a'},
-        ]
-        self.histories = {c['name']: [] for c in self.contacts}
-        self.histories['Alex K.'] = [
-            {'side': 'recv', 'morse': '.-- .... .- - ... / ..- .--.', 'original': "What's up?"},
-            {'side': 'sent', 'morse': '- .... .. ... / .- .--. .--. / .. ... / -.-. --- --- .-..', 'original': 'This app is cool'},
-            {'side': 'recv', 'morse': '-.-. .-.. .- ... ... / .--. .-. --- .--- . -.-. -', 'original': 'Class project?'},
-        ]
-        self.active = 'Alex K.'
+        self._user_id  = user_id
+        self.contacts  = []
+        self.histories = {}
+        self.active_contact = None
         self._build_ui()
-        self._load_chat(self.active)
+        self._reload_contacts()
+        self._start_polling()
+
+    # ── Polling for new messages ───────────────────────────────────────────────
+
+    def _start_polling(self):
+        self._poll()
+
+    def _poll(self):
+        if self.active_contact:
+            self._refresh_messages()
+        self._poll_job = self.after(3000, self._poll)
+
+    def _refresh_messages(self):
+        if not self.active_contact:
+            return
+        their_id = self.active_contact['id']
+        msgs = fetch_messages(self._user_id, their_id)
+        current = self.histories.get(self.active_contact['name'], [])
+        if len(msgs) != len(current):
+            self.histories[self.active_contact['name']] = msgs
+            self._redraw_messages()
+
+    def _redraw_messages(self):
+        for w in self.msg_frame.winfo_children():
+            w.destroy()
+        name = self.active_contact['name']
+        for msg in self.histories.get(name, []):
+            self._render_message(msg['side'], msg['morse'], msg['original'])
+        self._scroll_bottom()
+
+    # ── Contacts ──────────────────────────────────────────────────────────────
+
+    def _reload_contacts(self):
+        def _fetch():
+            contacts = fetch_contacts(self._user_id)
+            self.after(0, lambda: self._update_contacts(contacts))
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _update_contacts(self, contacts: list):
+        self.contacts = contacts
+        for c in self.contacts:
+            if c['name'] not in self.histories:
+                self.histories[c['name']] = []
+            c['color'] = CONTACT_COLORS[hash(c['name']) % len(CONTACT_COLORS)]
+
+        # Rebuild contacts list in sidebar
+        for w in self._contacts_frame.winfo_children():
+            w.destroy()
+        self.contact_btns = {}
+
+        if not self.contacts:
+            tk.Label(self._contacts_frame,
+                     text='No contacts yet.\nClick + to add someone.',
+                     font=('Helvetica', 9), bg=BG_PANEL, fg=TEXT_MORSE,
+                     justify='center').pack(pady=20)
+        else:
+            for c in self.contacts:
+                self._make_contact_row(self._contacts_frame, c)
+
+        if self.contacts and not self.active_contact:
+            self._switch_contact(self.contacts[0])
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
@@ -374,15 +609,14 @@ class MorseChatApp(tk.Tk):
         side.grid_rowconfigure(2, weight=1)
         side.grid_columnconfigure(0, weight=1)
 
-        # App header
-        hdr = tk.Frame(side, bg=BG_PANEL, pady=16, padx=16)
+        hdr = tk.Frame(side, bg=BG_PANEL, pady=14, padx=14)
         hdr.grid(row=0, column=0, sticky='ew')
 
         top_row = tk.Frame(hdr, bg=BG_PANEL)
         top_row.pack(fill='x')
-        tk.Label(top_row, text='◉', font=('Courier', 14, 'bold'),
+        tk.Label(top_row, text='◉', font=('Courier', 13, 'bold'),
                  bg=BG_PANEL, fg=ACCENT).pack(side='left', padx=(0, 6))
-        tk.Label(top_row, text='GhostWire', font=('Helvetica', 13, 'bold'),
+        tk.Label(top_row, text='GhostWire', font=('Helvetica', 12, 'bold'),
                  bg=BG_PANEL, fg=TEXT_PRI).pack(side='left')
 
         user_row = tk.Frame(hdr, bg=BG_PANEL)
@@ -391,14 +625,12 @@ class MorseChatApp(tk.Tk):
         dot_c = tk.Canvas(user_row, width=8, height=8, bg=BG_PANEL, highlightthickness=0)
         dot_c.pack(side='left', padx=(0, 6))
         dot_c.create_oval(1, 1, 7, 7, fill=TEAL, outline='')
-
         tk.Label(user_row, text=self._username, font=('Helvetica', 10),
                  bg=BG_PANEL, fg=TEXT_SEC).pack(side='left')
 
         logout_btn = tk.Button(
-            user_row, text='logout',
-            font=('Helvetica', 8), bg=BG_PANEL, fg=TEXT_MORSE,
-            activebackground=BG_HOVER, activeforeground=TEXT_SEC,
+            user_row, text='logout', font=('Helvetica', 8),
+            bg=BG_PANEL, fg=TEXT_MORSE, activebackground=BG_HOVER,
             relief='flat', cursor='hand2', padx=6, pady=2,
             command=self._logout)
         logout_btn.pack(side='right')
@@ -407,22 +639,27 @@ class MorseChatApp(tk.Tk):
 
         divider(side).grid(row=1, column=0, sticky='ew')
 
-        # Contacts
         contacts_wrap = tk.Frame(side, bg=BG_PANEL)
         contacts_wrap.grid(row=2, column=0, sticky='nsew', pady=6)
 
-        tk.Label(contacts_wrap, text='CONVERSATIONS',
+        conv_hdr = tk.Frame(contacts_wrap, bg=BG_PANEL)
+        conv_hdr.pack(fill='x', padx=10, pady=(8, 4))
+        tk.Label(conv_hdr, text='CONVERSATIONS',
                  font=('Helvetica', 8, 'bold'), bg=BG_PANEL,
-                 fg=TEXT_MORSE).pack(anchor='w', padx=16, pady=(8, 4))
+                 fg=TEXT_MORSE).pack(side='left', padx=6)
+        add_btn = make_btn(conv_hdr, '+ Add Contact', self._open_invite,
+                           font_size=8, bold=True, padx=8, pady=4,
+                           bg=ACCENT, hover=ACCENT_HOVER)
+        add_btn.pack(side='right')
 
+        self._contacts_frame = tk.Frame(contacts_wrap, bg=BG_PANEL)
+        self._contacts_frame.pack(fill='both', expand=True)
         self.contact_btns = {}
-        for c in self.contacts:
-            self._make_contact_row(contacts_wrap, c)
 
     def _make_contact_row(self, parent, c: dict) -> None:
-        name     = c['name']
-        is_active = (name == self.active)
-        row_bg   = BG_ACTIVE if is_active else BG_PANEL
+        name      = c['name']
+        is_active = self.active_contact and self.active_contact['name'] == name
+        row_bg    = BG_ACTIVE if is_active else BG_PANEL
 
         row = tk.Frame(parent, bg=row_bg, cursor='hand2')
         row.pack(fill='x', padx=6, pady=1)
@@ -437,38 +674,35 @@ class MorseChatApp(tk.Tk):
 
         txt = tk.Frame(inner, bg=row_bg)
         txt.pack(side='left', fill='x', expand=True)
-
         name_lbl = tk.Label(txt, text=name, font=('Helvetica', 11, 'bold'),
                              bg=row_bg, fg=TEXT_PRI)
         name_lbl.pack(anchor='w')
 
-        last = (self.histories[name][-1]['morse'][:24] + '…') if self.histories[name] else '—'
+        last_msgs = self.histories.get(name, [])
+        last = (last_msgs[-1]['morse'][:22] + '…') if last_msgs else '—'
         preview_lbl = tk.Label(txt, text=last, font=('Courier', 8),
                                 bg=row_bg, fg=TEXT_MORSE)
         preview_lbl.pack(anchor='w')
 
-        if c['online']:
-            dot = tk.Canvas(inner, width=8, height=8, bg=row_bg, highlightthickness=0)
-            dot.pack(side='right', padx=(4, 2))
-            dot.create_oval(1, 1, 7, 7, fill=TEAL, outline='')
-
         all_w = [row, inner, av, txt, name_lbl, preview_lbl]
-        for w in all_w:
-            w.bind('<Button-1>', lambda e, n=name: self._switch_contact(n))
+
+        def on_click(e, contact=c):
+            self._switch_contact(contact)
 
         def on_enter(e, widgets=all_w, n=name):
-            if n != self.active:
+            if not self.active_contact or self.active_contact['name'] != n:
                 for w in widgets:
                     try: w.configure(bg=BG_HOVER)
                     except Exception: pass
 
         def on_leave(e, widgets=all_w, n=name):
-            if n != self.active:
+            if not self.active_contact or self.active_contact['name'] != n:
                 for w in widgets:
                     try: w.configure(bg=BG_PANEL)
                     except Exception: pass
 
         for w in all_w:
+            w.bind('<Button-1>', on_click)
             w.bind('<Enter>', on_enter)
             w.bind('<Leave>', on_leave)
 
@@ -480,7 +714,6 @@ class MorseChatApp(tk.Tk):
         pane.grid_rowconfigure(1, weight=1)
         pane.grid_columnconfigure(0, weight=1)
 
-        # Chat header
         self.chat_header = tk.Frame(pane, bg=BG_PANEL, pady=12, padx=18)
         self.chat_header.grid(row=0, column=0, columnspan=2, sticky='ew')
 
@@ -490,16 +723,15 @@ class MorseChatApp(tk.Tk):
 
         hdr_txt = tk.Frame(self.chat_header, bg=BG_PANEL)
         hdr_txt.pack(side='left')
-        self.hdr_name = tk.Label(hdr_txt, text='', font=('Helvetica', 13, 'bold'),
-                                  bg=BG_PANEL, fg=TEXT_PRI)
+        self.hdr_name = tk.Label(hdr_txt, text='Select a contact',
+                                  font=('Helvetica', 13, 'bold'), bg=BG_PANEL, fg=TEXT_PRI)
         self.hdr_name.pack(anchor='w')
-        self.hdr_status = tk.Label(hdr_txt, text='● online',
-                                    font=('Helvetica', 9), bg=BG_PANEL, fg=TEAL)
-        self.hdr_status.pack(anchor='w')
+        self.hdr_sub = tk.Label(hdr_txt, text='Add a contact with the + button',
+                                 font=('Helvetica', 9), bg=BG_PANEL, fg=TEXT_MORSE)
+        self.hdr_sub.pack(anchor='w')
 
         divider(pane).grid(row=0, column=0, columnspan=2, sticky='sew')
 
-        # Scrollable messages
         self.msg_canvas = tk.Canvas(pane, bg=BG_DARK, highlightthickness=0, bd=0)
         self.msg_canvas.grid(row=1, column=0, sticky='nsew')
 
@@ -513,14 +745,16 @@ class MorseChatApp(tk.Tk):
 
         self.msg_frame.bind('<Configure>', self._on_frame_configure)
         self.msg_canvas.bind('<Configure>', self._on_canvas_configure)
-        self.msg_canvas.bind_all('<MouseWheel>', self._on_mousewheel)
 
-        # Input bar
+        # Cross-platform mouse wheel scrolling (Windows/macOS use MouseWheel; Linux uses Button-4/5)
+        self.msg_canvas.bind_all('<MouseWheel>', self._on_mousewheel)
+        self.msg_canvas.bind_all('<Button-4>',   lambda e: self.msg_canvas.yview_scroll(-1, 'units'))
+        self.msg_canvas.bind_all('<Button-5>',   lambda e: self.msg_canvas.yview_scroll(1, 'units'))
+
         inp = tk.Frame(pane, bg=BG_PANEL, pady=12, padx=16)
         inp.grid(row=2, column=0, columnspan=2, sticky='ew')
         inp.grid_columnconfigure(0, weight=1)
 
-        # Morse preview
         prev_strip = tk.Frame(inp, bg=BG_CARD, padx=10, pady=6,
                                highlightthickness=1, highlightbackground=BORDER)
         prev_strip.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 10))
@@ -531,7 +765,6 @@ class MorseChatApp(tk.Tk):
                  font=('Courier', 10), bg=BG_CARD, fg=ACCENT,
                  anchor='w', wraplength=600, justify='left').pack(anchor='w')
 
-        # Text entry
         self.entry_var = tk.StringVar()
         self.entry_var.trace_add('write', self._on_type)
         entry = tk.Entry(inp, textvariable=self.entry_var,
@@ -542,78 +775,86 @@ class MorseChatApp(tk.Tk):
         entry.grid(row=1, column=0, sticky='ew', ipady=9, padx=(0, 10))
         entry.bind('<Return>', lambda e: self._send())
 
-        send_btn = make_btn(inp, 'Send  ▶', self._send, font_size=10, pady=9, padx=18)
-        send_btn.grid(row=1, column=1)
+        make_btn(inp, 'Send  ▶', self._send, font_size=10, pady=9, padx=18).grid(row=1, column=1)
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
+    def _open_invite(self):
+        InviteDialog(self, self._user_id, self._reload_contacts)
+
     def _logout(self) -> None:
         if messagebox.askyesno('Logout', 'Log out of GhostWire?'):
+            if self._poll_job:
+                self.after_cancel(self._poll_job)
+                self._poll_job = None
             for w in self.winfo_children():
                 w.destroy()
-            self.grid_columnconfigure(0, weight=0)
-            self.grid_columnconfigure(1, weight=1)
+            # Reset grid weights for auth screen (full-width single column)
+            self.grid_columnconfigure(0, weight=1)
+            self.grid_columnconfigure(1, weight=0)
             AuthScreen(self, self._on_login)
 
-    def _switch_contact(self, name: str) -> None:
-        old, self.active = self.active, name
-        self._refresh_sidebar_highlight(old, name)
-        self._load_chat(name)
+    def _switch_contact(self, contact: dict) -> None:
+        self.active_contact = contact
+        self._refresh_sidebar_highlight()
+        self._load_chat(contact)
 
-    def _refresh_sidebar_highlight(self, old: str, new: str) -> None:
-        if old in self.contact_btns:
-            for w in self.contact_btns[old]:
-                try: w.configure(bg=BG_PANEL)
-                except Exception: pass
-        if new in self.contact_btns:
-            for w in self.contact_btns[new]:
-                try: w.configure(bg=BG_ACTIVE)
+    def _refresh_sidebar_highlight(self):
+        for name, widgets in self.contact_btns.items():
+            color = BG_ACTIVE if (self.active_contact and self.active_contact['name'] == name) else BG_PANEL
+            for w in widgets:
+                try: w.configure(bg=color)
                 except Exception: pass
 
-    def _load_chat(self, name: str) -> None:
-        c = next(x for x in self.contacts if x['name'] == name)
-        self.hdr_name.config(text=name)
-        self.hdr_status.config(
-            text='● online' if c['online'] else '○ offline',
-            fg=TEAL if c['online'] else TEXT_MORSE,
-        )
+    def _load_chat(self, contact: dict) -> None:
+        self.hdr_name.config(text=contact['name'])
+        self.hdr_sub.config(text='GhostWire user', fg=TEAL)
         self.hdr_canvas.delete('all')
-        self.hdr_canvas.create_oval(2, 2, 38, 38, fill=c['color'], outline='')
-        self.hdr_canvas.create_text(20, 20, text=c['initials'],
+        self.hdr_canvas.create_oval(2, 2, 38, 38, fill=contact['color'], outline='')
+        self.hdr_canvas.create_text(20, 20, text=contact['initials'],
                                      fill='#d6d3e8', font=('Helvetica', 10, 'bold'))
-        for w in self.msg_frame.winfo_children():
-            w.destroy()
-        for msg in self.histories[name]:
-            self._render_message(msg['side'], msg['morse'], msg['original'])
-        self._scroll_bottom()
+
+        # Load messages in background
+        def _fetch():
+            msgs = fetch_messages(self._user_id, contact['id'])
+            self.histories[contact['name']] = msgs
+            self.after(0, self._redraw_messages)
+
+        threading.Thread(target=_fetch, daemon=True).start()
 
     def _on_type(self, *_) -> None:
         text = self.entry_var.get()
         self.preview_var.set(to_morse(text) if text else 'start typing…')
 
     def _send(self) -> None:
+        if not self.active_contact:
+            return
         text = self.entry_var.get().strip()
         if not text:
             return
         morse = to_morse(text)
-        self.histories[self.active].append({'side': 'sent', 'morse': morse, 'original': text})
-        self._render_message('sent', morse, text)
         self.entry_var.set('')
         self.preview_var.set('start typing…')
-        self._scroll_bottom()
+
+        def _do_send():
+            send_message(self._user_id, self.active_contact['id'], morse, text)
+            msgs = fetch_messages(self._user_id, self.active_contact['id'])
+            self.histories[self.active_contact['name']] = msgs
+            self.after(0, self._redraw_messages)
+
+        threading.Thread(target=_do_send, daemon=True).start()
 
     def _render_message(self, side: str, morse: str, original: str) -> None:
         outer = tk.Frame(self.msg_frame, bg=BG_DARK)
         outer.pack(fill='x', padx=16, pady=6)
 
         if side == 'sent':
-            bubble_bg, bubble_fg, anchor = BG_SENT, TEXT_SENT, 'e'
-            inner = tk.Frame(outer, bg=BG_DARK)
-            inner.pack(side='right')
+            bubble_bg, bubble_fg, pack_side, anchor = BG_SENT, TEXT_SENT, 'right', 'e'
         else:
-            bubble_bg, bubble_fg, anchor = BG_RECV, TEXT_PRI, 'w'
-            inner = tk.Frame(outer, bg=BG_DARK)
-            inner.pack(side='left')
+            bubble_bg, bubble_fg, pack_side, anchor = BG_RECV, TEXT_PRI, 'left', 'w'
+
+        inner = tk.Frame(outer, bg=BG_DARK)
+        inner.pack(side=pack_side)
 
         bubble = tk.Frame(inner, bg=bubble_bg, padx=14, pady=10,
                            highlightthickness=1, highlightbackground=BORDER_LIGHT)
@@ -663,6 +904,7 @@ class MorseChatApp(tk.Tk):
         self.msg_canvas.itemconfig(self.msg_window, width=event.width)
 
     def _on_mousewheel(self, event) -> None:
+        # Windows/macOS: event.delta is ±120 multiples; Linux uses Button-4/5 bindings above
         self.msg_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
 
     def _scroll_bottom(self) -> None:
