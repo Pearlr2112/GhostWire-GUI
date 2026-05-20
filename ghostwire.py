@@ -99,24 +99,76 @@ def db_login(username: str, password: str) -> tuple[bool, str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Colour palette
+#  Colour palette  (deep navy, no white)
 # ──────────────────────────────────────────────────────────────────────────────
 
-BG_DARK      = '#0e0e12'
-BG_PANEL     = '#16161e'
-BG_INPUT     = '#1c1c26'
-BG_SENT      = '#2a2250'
-BG_RECV      = '#1c1c26'
+BG_DARK      = '#0b0d14'
+BG_PANEL     = '#13151f'
+BG_CARD      = '#1a1d2e'
+BG_INPUT     = '#21253a'
+BG_SENT      = '#2d2a52'
+BG_RECV      = '#1a1d2e'
+BG_HOVER     = '#252840'
+BG_ACTIVE    = '#1e2038'
+
 ACCENT       = '#7c6af7'
-ACCENT_LIGHT = '#a594ff'
-TEAL         = '#3ecf8e'
-TEAL_DARK    = '#1a6646'
-TEXT_PRI     = '#e8e6f0'
-TEXT_SEC     = '#8884a8'
-TEXT_MORSE   = '#5c5a7a'
-BORDER       = '#2a2838'
+ACCENT_HOVER = '#9182ff'
+ACCENT_DIM   = '#3d3578'
+
+TEAL         = '#2dd4a0'
+TEAL_DARK    = '#163d2e'
+TEAL_FG      = '#7ef5c8'
+
+TEXT_PRI     = '#d6d3e8'
+TEXT_SEC     = '#7a7897'
+TEXT_MORSE   = '#4a4868'
+TEXT_SENT    = '#c4beff'
+
+BORDER       = '#252840'
+BORDER_LIGHT = '#2e3152'
+
 RED_ERR      = '#e05c6a'
-GREEN_OK     = '#3ecf8e'
+GREEN_OK     = '#2dd4a0'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Widget helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def make_entry(parent, textvariable, show=None):
+    return tk.Entry(
+        parent,
+        textvariable=textvariable,
+        show=show,
+        font=('Helvetica', 12),
+        bg=BG_INPUT,
+        fg=TEXT_PRI,
+        insertbackground=ACCENT,
+        relief='flat',
+        highlightthickness=1,
+        highlightbackground=BORDER_LIGHT,
+        highlightcolor=ACCENT,
+    )
+
+
+def make_btn(parent, text, command, fg='#d6d3e8', bg=ACCENT, hover=ACCENT_HOVER,
+             font_size=10, bold=True, padx=16, pady=8):
+    weight = 'bold' if bold else 'normal'
+    btn = tk.Button(
+        parent, text=text, command=command,
+        font=('Helvetica', font_size, weight),
+        bg=bg, fg=fg,
+        activebackground=hover, activeforeground=fg,
+        relief='flat', cursor='hand2',
+        padx=padx, pady=pady, bd=0,
+    )
+    btn.bind('<Enter>', lambda e: btn.config(bg=hover))
+    btn.bind('<Leave>', lambda e: btn.config(bg=bg))
+    return btn
+
+
+def divider(parent):
+    return tk.Frame(parent, bg=BORDER, height=1)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -136,92 +188,83 @@ class AuthScreen(tk.Frame):
         self.place(relx=0, rely=0, relwidth=1, relheight=1)
 
         card = tk.Frame(self, bg=BG_PANEL,
-                        highlightthickness=1, highlightbackground=BORDER)
-        card.place(relx=0.5, rely=0.5, anchor='center', width=380)
+                        highlightthickness=1, highlightbackground=BORDER_LIGHT)
+        card.place(relx=0.5, rely=0.5, anchor='center', width=400)
 
         # Logo
-        logo = tk.Frame(card, bg=BG_PANEL, pady=28)
+        logo = tk.Frame(card, bg=BG_PANEL, pady=30)
         logo.pack(fill='x')
-        tk.Label(logo, text='◉', font=('Courier', 28),
+        tk.Label(logo, text='◉', font=('Courier', 30, 'bold'),
                  bg=BG_PANEL, fg=ACCENT).pack()
-        tk.Label(logo, text='GhostWire', font=('Courier', 18, 'bold'),
-                 bg=BG_PANEL, fg=ACCENT_LIGHT).pack()
+        tk.Label(logo, text='GhostWire', font=('Helvetica', 20, 'bold'),
+                 bg=BG_PANEL, fg=TEXT_PRI).pack(pady=(4, 0))
         tk.Label(logo, text='secure · morse · messaging',
-                 font=('Courier', 9), bg=BG_PANEL, fg=TEXT_MORSE).pack(pady=(2, 0))
+                 font=('Helvetica', 9), bg=BG_PANEL, fg=TEXT_MORSE).pack(pady=(3, 0))
 
-        tk.Frame(card, bg=BORDER, height=1).pack(fill='x')
+        divider(card).pack(fill='x')
 
-        # Tab bar
-        tabs = tk.Frame(card, bg=BG_PANEL)
+        # Tabs
+        tabs = tk.Frame(card, bg=BG_CARD)
         tabs.pack(fill='x')
-        self._tab_login = tk.Button(
-            tabs, text='Login', font=('Courier', 10, 'bold'),
-            bg=ACCENT, fg='#fff', relief='flat', cursor='hand2',
-            padx=20, pady=8, command=lambda: self._switch('login'))
-        self._tab_login.pack(side='left', fill='x', expand=True)
-        self._tab_reg = tk.Button(
-            tabs, text='Register', font=('Courier', 10, 'bold'),
-            bg=BG_INPUT, fg=TEXT_SEC, relief='flat', cursor='hand2',
-            padx=20, pady=8, command=lambda: self._switch('register'))
-        self._tab_reg.pack(side='left', fill='x', expand=True)
+        tabs.grid_columnconfigure(0, weight=1)
+        tabs.grid_columnconfigure(1, weight=1)
 
-        tk.Frame(card, bg=BORDER, height=1).pack(fill='x')
+        self._tab_login = tk.Button(
+            tabs, text='Login', font=('Helvetica', 10, 'bold'),
+            bg=ACCENT, fg='#d6d3e8',
+            activebackground=ACCENT_HOVER, activeforeground='#d6d3e8',
+            relief='flat', cursor='hand2', pady=10,
+            command=lambda: self._switch('login'))
+        self._tab_login.grid(row=0, column=0, sticky='ew')
+
+        self._tab_reg = tk.Button(
+            tabs, text='Register', font=('Helvetica', 10, 'bold'),
+            bg=BG_CARD, fg=TEXT_SEC,
+            activebackground=BG_HOVER, activeforeground=TEXT_PRI,
+            relief='flat', cursor='hand2', pady=10,
+            command=lambda: self._switch('register'))
+        self._tab_reg.grid(row=0, column=1, sticky='ew')
+
+        divider(card).pack(fill='x')
 
         # Form
-        form = tk.Frame(card, bg=BG_PANEL, padx=32, pady=24)
+        form = tk.Frame(card, bg=BG_PANEL, padx=36, pady=28)
         form.pack(fill='x')
 
-        tk.Label(form, text='username', font=('Courier', 9),
-                 bg=BG_PANEL, fg=TEXT_MORSE).pack(anchor='w')
+        tk.Label(form, text='Username', font=('Helvetica', 9),
+                 bg=BG_PANEL, fg=TEXT_SEC).pack(anchor='w')
         self._user_var = tk.StringVar()
-        self._user_entry = tk.Entry(
-            form, textvariable=self._user_var,
-            font=('Courier', 12), bg=BG_INPUT, fg=TEXT_PRI,
-            insertbackground=ACCENT_LIGHT, relief='flat',
-            highlightthickness=1, highlightbackground=BORDER,
-            highlightcolor=ACCENT)
-        self._user_entry.pack(fill='x', ipady=7, pady=(2, 14))
+        self._user_entry = make_entry(form, self._user_var)
+        self._user_entry.pack(fill='x', ipady=8, pady=(3, 16))
 
-        tk.Label(form, text='password', font=('Courier', 9),
-                 bg=BG_PANEL, fg=TEXT_MORSE).pack(anchor='w')
+        tk.Label(form, text='Password', font=('Helvetica', 9),
+                 bg=BG_PANEL, fg=TEXT_SEC).pack(anchor='w')
         self._pw_var = tk.StringVar()
-        self._pw_entry = tk.Entry(
-            form, textvariable=self._pw_var, show='●',
-            font=('Courier', 12), bg=BG_INPUT, fg=TEXT_PRI,
-            insertbackground=ACCENT_LIGHT, relief='flat',
-            highlightthickness=1, highlightbackground=BORDER,
-            highlightcolor=ACCENT)
-        self._pw_entry.pack(fill='x', ipady=7, pady=(2, 0))
+        self._pw_entry = make_entry(form, self._pw_var, show='●')
+        self._pw_entry.pack(fill='x', ipady=8, pady=(3, 0))
 
         # Confirm password (register only)
         self._confirm_frame = tk.Frame(form, bg=BG_PANEL)
         self._confirm_frame.pack(fill='x')
-        tk.Label(self._confirm_frame, text='confirm password', font=('Courier', 9),
-                 bg=BG_PANEL, fg=TEXT_MORSE).pack(anchor='w')
+        tk.Label(self._confirm_frame, text='Confirm Password', font=('Helvetica', 9),
+                 bg=BG_PANEL, fg=TEXT_SEC).pack(anchor='w', pady=(16, 0))
         self._confirm_var = tk.StringVar()
-        tk.Entry(
-            self._confirm_frame, textvariable=self._confirm_var, show='●',
-            font=('Courier', 12), bg=BG_INPUT, fg=TEXT_PRI,
-            insertbackground=ACCENT_LIGHT, relief='flat',
-            highlightthickness=1, highlightbackground=BORDER,
-            highlightcolor=ACCENT).pack(fill='x', ipady=7, pady=(2, 0))
+        make_entry(self._confirm_frame, self._confirm_var,
+                   show='●').pack(fill='x', ipady=8, pady=(3, 0))
         self._confirm_frame.pack_forget()
 
-        # Status label
+        # Status
         self._status_var = tk.StringVar()
         self._status_lbl = tk.Label(
             form, textvariable=self._status_var,
-            font=('Courier', 9), bg=BG_PANEL, fg=RED_ERR,
-            wraplength=300, justify='left')
-        self._status_lbl.pack(anchor='w', pady=(10, 0))
+            font=('Helvetica', 9), bg=BG_PANEL, fg=RED_ERR,
+            wraplength=310, justify='left')
+        self._status_lbl.pack(anchor='w', pady=(12, 0))
 
-        # Submit button
-        self._submit_btn = tk.Button(
-            form, text='Login  ▶', font=('Courier', 11, 'bold'),
-            bg=ACCENT, fg='#fff', activebackground=ACCENT_LIGHT,
-            relief='flat', cursor='hand2', pady=9,
-            command=self._submit)
-        self._submit_btn.pack(fill='x', pady=(14, 0))
+        # Submit
+        self._submit_btn = make_btn(form, 'Login  →', self._submit,
+                                     font_size=11, pady=10)
+        self._submit_btn.pack(fill='x', pady=(14, 4))
 
         self.master.bind('<Return>', lambda e: self._submit())
         self._user_entry.focus_set()
@@ -230,15 +273,15 @@ class AuthScreen(tk.Frame):
         self._mode = mode
         self._status_var.set('')
         if mode == 'login':
-            self._tab_login.config(bg=ACCENT, fg='#fff')
-            self._tab_reg.config(bg=BG_INPUT, fg=TEXT_SEC)
+            self._tab_login.config(bg=ACCENT, fg='#d6d3e8')
+            self._tab_reg.config(bg=BG_CARD, fg=TEXT_SEC)
             self._confirm_frame.pack_forget()
-            self._submit_btn.config(text='Login  ▶')
+            self._submit_btn.config(text='Login  →')
         else:
-            self._tab_reg.config(bg=ACCENT, fg='#fff')
-            self._tab_login.config(bg=BG_INPUT, fg=TEXT_SEC)
+            self._tab_reg.config(bg=ACCENT, fg='#d6d3e8')
+            self._tab_login.config(bg=BG_CARD, fg=TEXT_SEC)
             self._confirm_frame.pack(fill='x')
-            self._submit_btn.config(text='Create Account  ▶')
+            self._submit_btn.config(text='Create Account  →')
 
     def _submit(self) -> None:
         username = self._user_var.get().strip()
@@ -287,8 +330,8 @@ class MorseChatApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('GhostWire')
-        self.geometry('860x620')
-        self.minsize(700, 500)
+        self.geometry('920x640')
+        self.minsize(720, 520)
         self.configure(bg=BG_DARK)
         self.resizable(True, True)
 
@@ -302,8 +345,8 @@ class MorseChatApp(tk.Tk):
         self.contacts = [
             {'name': 'Alex K.',   'initials': 'AK', 'online': True,  'color': ACCENT},
             {'name': 'Sam R.',    'initials': 'SR', 'online': True,  'color': TEAL},
-            {'name': 'Jordan T.', 'initials': 'JT', 'online': False, 'color': '#d4537e'},
-            {'name': 'Morgan B.', 'initials': 'MB', 'online': True,  'color': '#ef9f27'},
+            {'name': 'Jordan T.', 'initials': 'JT', 'online': False, 'color': '#c45c8a'},
+            {'name': 'Morgan B.', 'initials': 'MB', 'online': True,  'color': '#d4893a'},
         ]
         self.histories = {c['name']: [] for c in self.contacts}
         self.histories['Alex K.'] = [
@@ -325,68 +368,111 @@ class MorseChatApp(tk.Tk):
         self._build_chat_pane()
 
     def _build_sidebar(self) -> None:
-        side = tk.Frame(self, bg=BG_PANEL, width=220)
+        side = tk.Frame(self, bg=BG_PANEL, width=240)
         side.grid(row=0, column=0, sticky='nsew')
         side.grid_propagate(False)
-        side.grid_rowconfigure(1, weight=1)
+        side.grid_rowconfigure(2, weight=1)
+        side.grid_columnconfigure(0, weight=1)
 
-        hdr = tk.Frame(side, bg=BG_PANEL, pady=12, padx=14)
+        # App header
+        hdr = tk.Frame(side, bg=BG_PANEL, pady=16, padx=16)
         hdr.grid(row=0, column=0, sticky='ew')
 
-        tk.Label(hdr, text='◉ GhostWire', font=('Courier', 13, 'bold'),
-                 bg=BG_PANEL, fg=ACCENT_LIGHT).pack(anchor='w')
+        top_row = tk.Frame(hdr, bg=BG_PANEL)
+        top_row.pack(fill='x')
+        tk.Label(top_row, text='◉', font=('Courier', 14, 'bold'),
+                 bg=BG_PANEL, fg=ACCENT).pack(side='left', padx=(0, 6))
+        tk.Label(top_row, text='GhostWire', font=('Helvetica', 13, 'bold'),
+                 bg=BG_PANEL, fg=TEXT_PRI).pack(side='left')
 
         user_row = tk.Frame(hdr, bg=BG_PANEL)
-        user_row.pack(fill='x', pady=(4, 0))
-        tk.Label(user_row, text=f'● {self._username}', font=('Courier', 9),
-                 bg=BG_PANEL, fg=TEAL).pack(side='left')
-        tk.Button(user_row, text='logout', font=('Courier', 8),
-                  bg=BG_PANEL, fg=TEXT_MORSE, relief='flat', cursor='hand2',
-                  command=self._logout).pack(side='right')
+        user_row.pack(fill='x', pady=(8, 0))
 
-        tk.Frame(side, bg=BORDER, height=1).grid(row=0, column=0, sticky='sew')
+        dot_c = tk.Canvas(user_row, width=8, height=8, bg=BG_PANEL, highlightthickness=0)
+        dot_c.pack(side='left', padx=(0, 6))
+        dot_c.create_oval(1, 1, 7, 7, fill=TEAL, outline='')
 
-        contacts_frame = tk.Frame(side, bg=BG_PANEL)
-        contacts_frame.grid(row=1, column=0, sticky='nsew', padx=6, pady=6)
+        tk.Label(user_row, text=self._username, font=('Helvetica', 10),
+                 bg=BG_PANEL, fg=TEXT_SEC).pack(side='left')
+
+        logout_btn = tk.Button(
+            user_row, text='logout',
+            font=('Helvetica', 8), bg=BG_PANEL, fg=TEXT_MORSE,
+            activebackground=BG_HOVER, activeforeground=TEXT_SEC,
+            relief='flat', cursor='hand2', padx=6, pady=2,
+            command=self._logout)
+        logout_btn.pack(side='right')
+        logout_btn.bind('<Enter>', lambda e: logout_btn.config(fg=TEXT_SEC))
+        logout_btn.bind('<Leave>', lambda e: logout_btn.config(fg=TEXT_MORSE))
+
+        divider(side).grid(row=1, column=0, sticky='ew')
+
+        # Contacts
+        contacts_wrap = tk.Frame(side, bg=BG_PANEL)
+        contacts_wrap.grid(row=2, column=0, sticky='nsew', pady=6)
+
+        tk.Label(contacts_wrap, text='CONVERSATIONS',
+                 font=('Helvetica', 8, 'bold'), bg=BG_PANEL,
+                 fg=TEXT_MORSE).pack(anchor='w', padx=16, pady=(8, 4))
 
         self.contact_btns = {}
         for c in self.contacts:
-            self._make_contact_row(contacts_frame, c)
+            self._make_contact_row(contacts_wrap, c)
 
     def _make_contact_row(self, parent, c: dict) -> None:
-        name = c['name']
-        row  = tk.Frame(parent, bg=BG_PANEL, cursor='hand2')
-        row.pack(fill='x', pady=2)
-        inner = tk.Frame(row, bg=BG_PANEL, padx=10, pady=8)
+        name     = c['name']
+        is_active = (name == self.active)
+        row_bg   = BG_ACTIVE if is_active else BG_PANEL
+
+        row = tk.Frame(parent, bg=row_bg, cursor='hand2')
+        row.pack(fill='x', padx=6, pady=1)
+        inner = tk.Frame(row, bg=row_bg, padx=10, pady=9)
         inner.pack(fill='x')
 
-        av = tk.Canvas(inner, width=34, height=34, bg=BG_PANEL, highlightthickness=0)
-        av.pack(side='left', padx=(0, 8))
-        av.create_oval(2, 2, 32, 32, fill=c['color'], outline='')
-        av.create_text(17, 17, text=c['initials'], fill='#fff', font=('Courier', 9, 'bold'))
+        av = tk.Canvas(inner, width=38, height=38, bg=row_bg, highlightthickness=0)
+        av.pack(side='left', padx=(0, 10))
+        av.create_oval(2, 2, 36, 36, fill=c['color'], outline='')
+        av.create_text(19, 19, text=c['initials'], fill='#d6d3e8',
+                       font=('Helvetica', 10, 'bold'))
 
-        txt = tk.Frame(inner, bg=BG_PANEL)
+        txt = tk.Frame(inner, bg=row_bg)
         txt.pack(side='left', fill='x', expand=True)
-        tk.Label(txt, text=name, font=('Courier', 11, 'bold'),
-                 bg=BG_PANEL, fg=TEXT_PRI).pack(anchor='w')
-        last = (self.histories[name][-1]['morse'][:22] + '…') if self.histories[name] else '—'
-        tk.Label(txt, text=last, font=('Courier', 9),
-                 bg=BG_PANEL, fg=TEXT_MORSE).pack(anchor='w')
+
+        name_lbl = tk.Label(txt, text=name, font=('Helvetica', 11, 'bold'),
+                             bg=row_bg, fg=TEXT_PRI)
+        name_lbl.pack(anchor='w')
+
+        last = (self.histories[name][-1]['morse'][:24] + '…') if self.histories[name] else '—'
+        preview_lbl = tk.Label(txt, text=last, font=('Courier', 8),
+                                bg=row_bg, fg=TEXT_MORSE)
+        preview_lbl.pack(anchor='w')
 
         if c['online']:
-            dot = tk.Canvas(inner, width=10, height=10, bg=BG_PANEL, highlightthickness=0)
-            dot.pack(side='right', padx=(0, 2))
-            dot.create_oval(1, 1, 9, 9, fill=TEAL, outline='')
+            dot = tk.Canvas(inner, width=8, height=8, bg=row_bg, highlightthickness=0)
+            dot.pack(side='right', padx=(4, 2))
+            dot.create_oval(1, 1, 7, 7, fill=TEAL, outline='')
 
-        for w in (row, inner, av, txt):
+        all_w = [row, inner, av, txt, name_lbl, preview_lbl]
+        for w in all_w:
             w.bind('<Button-1>', lambda e, n=name: self._switch_contact(n))
-        for child in txt.winfo_children():
-            child.bind('<Button-1>', lambda e, n=name: self._switch_contact(n))
 
-        self.contact_btns[name] = row
-        if name == self.active:
-            row.configure(bg=BG_INPUT)
-            inner.configure(bg=BG_INPUT)
+        def on_enter(e, widgets=all_w, n=name):
+            if n != self.active:
+                for w in widgets:
+                    try: w.configure(bg=BG_HOVER)
+                    except Exception: pass
+
+        def on_leave(e, widgets=all_w, n=name):
+            if n != self.active:
+                for w in widgets:
+                    try: w.configure(bg=BG_PANEL)
+                    except Exception: pass
+
+        for w in all_w:
+            w.bind('<Enter>', on_enter)
+            w.bind('<Leave>', on_leave)
+
+        self.contact_btns[name] = all_w
 
     def _build_chat_pane(self) -> None:
         pane = tk.Frame(self, bg=BG_DARK)
@@ -394,30 +480,31 @@ class MorseChatApp(tk.Tk):
         pane.grid_rowconfigure(1, weight=1)
         pane.grid_columnconfigure(0, weight=1)
 
-        # Header
-        self.chat_header = tk.Frame(pane, bg=BG_PANEL, pady=10, padx=16)
-        self.chat_header.grid(row=0, column=0, sticky='ew')
+        # Chat header
+        self.chat_header = tk.Frame(pane, bg=BG_PANEL, pady=12, padx=18)
+        self.chat_header.grid(row=0, column=0, columnspan=2, sticky='ew')
 
-        self.hdr_canvas = tk.Canvas(self.chat_header, width=36, height=36,
+        self.hdr_canvas = tk.Canvas(self.chat_header, width=40, height=40,
                                     bg=BG_PANEL, highlightthickness=0)
-        self.hdr_canvas.pack(side='left', padx=(0, 10))
+        self.hdr_canvas.pack(side='left', padx=(0, 12))
 
         hdr_txt = tk.Frame(self.chat_header, bg=BG_PANEL)
         hdr_txt.pack(side='left')
-        self.hdr_name   = tk.Label(hdr_txt, text='', font=('Courier', 13, 'bold'),
-                                    bg=BG_PANEL, fg=TEXT_PRI)
+        self.hdr_name = tk.Label(hdr_txt, text='', font=('Helvetica', 13, 'bold'),
+                                  bg=BG_PANEL, fg=TEXT_PRI)
         self.hdr_name.pack(anchor='w')
-        self.hdr_status = tk.Label(hdr_txt, text='● online', font=('Courier', 9),
-                                    bg=BG_PANEL, fg=TEAL)
+        self.hdr_status = tk.Label(hdr_txt, text='● online',
+                                    font=('Helvetica', 9), bg=BG_PANEL, fg=TEAL)
         self.hdr_status.pack(anchor='w')
 
-        tk.Frame(pane, bg=BORDER, height=1).grid(row=0, column=0, sticky='sew')
+        divider(pane).grid(row=0, column=0, columnspan=2, sticky='sew')
 
-        # Scrollable message area
+        # Scrollable messages
         self.msg_canvas = tk.Canvas(pane, bg=BG_DARK, highlightthickness=0, bd=0)
         self.msg_canvas.grid(row=1, column=0, sticky='nsew')
 
-        sb = tk.Scrollbar(pane, orient='vertical', command=self.msg_canvas.yview)
+        sb = tk.Scrollbar(pane, orient='vertical', command=self.msg_canvas.yview,
+                          bg=BG_PANEL, troughcolor=BG_DARK, width=6)
         sb.grid(row=1, column=1, sticky='ns')
         self.msg_canvas.configure(yscrollcommand=sb.set)
 
@@ -429,34 +516,34 @@ class MorseChatApp(tk.Tk):
         self.msg_canvas.bind_all('<MouseWheel>', self._on_mousewheel)
 
         # Input bar
-        inp = tk.Frame(pane, bg=BG_PANEL, pady=10, padx=14)
-        inp.grid(row=2, column=0, sticky='ew')
+        inp = tk.Frame(pane, bg=BG_PANEL, pady=12, padx=16)
+        inp.grid(row=2, column=0, columnspan=2, sticky='ew')
         inp.grid_columnconfigure(0, weight=1)
 
-        prev = tk.Frame(inp, bg=BG_INPUT, padx=8, pady=4,
-                        highlightthickness=1, highlightbackground=BORDER)
-        prev.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 8))
-        tk.Label(prev, text='morse preview', font=('Courier', 8),
-                 bg=BG_INPUT, fg=TEXT_MORSE).pack(anchor='w')
+        # Morse preview
+        prev_strip = tk.Frame(inp, bg=BG_CARD, padx=10, pady=6,
+                               highlightthickness=1, highlightbackground=BORDER)
+        prev_strip.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 10))
+        tk.Label(prev_strip, text='MORSE PREVIEW', font=('Helvetica', 7, 'bold'),
+                 bg=BG_CARD, fg=TEXT_MORSE).pack(anchor='w')
         self.preview_var = tk.StringVar(value='start typing…')
-        tk.Label(prev, textvariable=self.preview_var,
-                 font=('Courier', 10), bg=BG_INPUT, fg=ACCENT_LIGHT,
-                 anchor='w', wraplength=560, justify='left').pack(anchor='w')
+        tk.Label(prev_strip, textvariable=self.preview_var,
+                 font=('Courier', 10), bg=BG_CARD, fg=ACCENT,
+                 anchor='w', wraplength=600, justify='left').pack(anchor='w')
 
+        # Text entry
         self.entry_var = tk.StringVar()
         self.entry_var.trace_add('write', self._on_type)
         entry = tk.Entry(inp, textvariable=self.entry_var,
-                         font=('Courier', 12), bg=BG_INPUT, fg=TEXT_PRI,
-                         insertbackground=ACCENT_LIGHT, relief='flat',
-                         highlightthickness=1, highlightbackground=BORDER,
+                         font=('Helvetica', 12), bg=BG_INPUT, fg=TEXT_PRI,
+                         insertbackground=ACCENT, relief='flat',
+                         highlightthickness=1, highlightbackground=BORDER_LIGHT,
                          highlightcolor=ACCENT)
-        entry.grid(row=1, column=0, sticky='ew', ipady=7, padx=(0, 8))
+        entry.grid(row=1, column=0, sticky='ew', ipady=9, padx=(0, 10))
         entry.bind('<Return>', lambda e: self._send())
 
-        tk.Button(inp, text='▶', font=('Courier', 13, 'bold'),
-                  bg=ACCENT, fg='#fff', activebackground=ACCENT_LIGHT,
-                  relief='flat', cursor='hand2', padx=10,
-                  command=self._send).grid(row=1, column=1)
+        send_btn = make_btn(inp, 'Send  ▶', self._send, font_size=10, pady=9, padx=18)
+        send_btn.grid(row=1, column=1)
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
@@ -474,23 +561,14 @@ class MorseChatApp(tk.Tk):
         self._load_chat(name)
 
     def _refresh_sidebar_highlight(self, old: str, new: str) -> None:
-        def _recolor(frame, color):
-            frame.configure(bg=color)
-            for child in frame.winfo_children():
-                try:
-                    child.configure(bg=color)
-                    for sub in child.winfo_children():
-                        try:
-                            sub.configure(bg=color)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
         if old in self.contact_btns:
-            _recolor(self.contact_btns[old], BG_PANEL)
+            for w in self.contact_btns[old]:
+                try: w.configure(bg=BG_PANEL)
+                except Exception: pass
         if new in self.contact_btns:
-            _recolor(self.contact_btns[new], BG_INPUT)
+            for w in self.contact_btns[new]:
+                try: w.configure(bg=BG_ACTIVE)
+                except Exception: pass
 
     def _load_chat(self, name: str) -> None:
         c = next(x for x in self.contacts if x['name'] == name)
@@ -500,9 +578,9 @@ class MorseChatApp(tk.Tk):
             fg=TEAL if c['online'] else TEXT_MORSE,
         )
         self.hdr_canvas.delete('all')
-        self.hdr_canvas.create_oval(2, 2, 34, 34, fill=c['color'], outline='')
-        self.hdr_canvas.create_text(18, 18, text=c['initials'],
-                                     fill='#fff', font=('Courier', 9, 'bold'))
+        self.hdr_canvas.create_oval(2, 2, 38, 38, fill=c['color'], outline='')
+        self.hdr_canvas.create_text(20, 20, text=c['initials'],
+                                     fill='#d6d3e8', font=('Helvetica', 10, 'bold'))
         for w in self.msg_frame.winfo_children():
             w.destroy()
         for msg in self.histories[name]:
@@ -526,10 +604,10 @@ class MorseChatApp(tk.Tk):
 
     def _render_message(self, side: str, morse: str, original: str) -> None:
         outer = tk.Frame(self.msg_frame, bg=BG_DARK)
-        outer.pack(fill='x', padx=14, pady=5)
+        outer.pack(fill='x', padx=16, pady=6)
 
         if side == 'sent':
-            bubble_bg, bubble_fg, anchor = BG_SENT, '#c8c2f0', 'e'
+            bubble_bg, bubble_fg, anchor = BG_SENT, TEXT_SENT, 'e'
             inner = tk.Frame(outer, bg=BG_DARK)
             inner.pack(side='right')
         else:
@@ -537,42 +615,44 @@ class MorseChatApp(tk.Tk):
             inner = tk.Frame(outer, bg=BG_DARK)
             inner.pack(side='left')
 
-        bubble = tk.Frame(inner, bg=bubble_bg, padx=12, pady=8,
-                           highlightthickness=1, highlightbackground=BORDER)
+        bubble = tk.Frame(inner, bg=bubble_bg, padx=14, pady=10,
+                           highlightthickness=1, highlightbackground=BORDER_LIGHT)
         bubble.pack(anchor=anchor)
         tk.Label(bubble, text=morse, font=('Courier', 11),
                  bg=bubble_bg, fg=bubble_fg,
-                 wraplength=380, justify='left').pack(anchor='w')
+                 wraplength=400, justify='left').pack(anchor='w')
+
+        meta_row = tk.Frame(inner, bg=BG_DARK)
+        meta_row.pack(fill='x', pady=(4, 0))
+
+        ts = time.strftime('%I:%M %p').lstrip('0')
 
         if side == 'sent':
-            tk.Label(inner, text=f'original: {original}',
-                     font=('Courier', 9), bg=BG_DARK, fg=TEXT_MORSE).pack(anchor='e', pady=(2, 0))
+            tk.Label(meta_row, text=original, font=('Helvetica', 9),
+                     bg=BG_DARK, fg=TEXT_MORSE).pack(side='right', padx=(8, 0))
+            tk.Label(meta_row, text=ts, font=('Helvetica', 8),
+                     bg=BG_DARK, fg=TEXT_MORSE).pack(side='right')
         else:
-            btn_frame = tk.Frame(inner, bg=BG_DARK)
-            btn_frame.pack(anchor='w', pady=(3, 0))
-            translated_lbl = tk.Label(inner, text='', font=('Courier', 10),
-                                       bg=BG_DARK, fg=TEAL, wraplength=380, justify='left')
+            translated_lbl = tk.Label(inner, text='', font=('Helvetica', 10),
+                                       bg=BG_DARK, fg=TEAL, wraplength=400, justify='left')
 
             def toggle(o=original, lbl=translated_lbl):
                 if lbl.cget('text'):
                     lbl.config(text='')
                     lbl.pack_forget()
-                    btn.config(text='⟺ translate')
+                    btn.config(text='⟺  translate')
                 else:
                     lbl.config(text=f'"{o}"')
-                    lbl.pack(anchor='w')
-                    btn.config(text='⟺ hide')
+                    lbl.pack(anchor='w', pady=(2, 0))
+                    btn.config(text='⟺  hide')
                 self._on_frame_configure()
 
-            btn = tk.Button(btn_frame, text='⟺ translate', font=('Courier', 9),
-                            bg=TEAL_DARK, fg='#a0f0cc', activebackground=TEAL,
-                            relief='flat', cursor='hand2', padx=8, pady=2,
-                            command=toggle)
+            btn = make_btn(meta_row, '⟺  translate', toggle,
+                           bg=TEAL_DARK, fg=TEAL_FG, hover='#1f5240',
+                           font_size=8, bold=False, padx=8, pady=3)
             btn.pack(side='left')
-
-        ts = time.strftime('%I:%M %p').lstrip('0')
-        tk.Label(inner, text=ts, font=('Courier', 8),
-                 bg=BG_DARK, fg=TEXT_MORSE).pack(anchor=anchor, pady=(2, 0))
+            tk.Label(meta_row, text=ts, font=('Helvetica', 8),
+                     bg=BG_DARK, fg=TEXT_MORSE).pack(side='left', padx=(8, 0))
 
     # ── Canvas helpers ────────────────────────────────────────────────────────
 
