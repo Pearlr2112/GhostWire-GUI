@@ -918,7 +918,10 @@ class MorseChatApp(tk.Tk):
 
     def _on_mousewheel(self, event) -> None:
         # Windows/macOS: event.delta is ±120 multiples; Linux uses Button-4/5 bindings above
-        self.msg_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+        if sys.platform == 'darwin':
+            self.msg_canvas.yview_scroll(-event.delta, 'units')
+        else:
+            self.msg_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
 
     def _scroll_bottom(self) -> None:
         self.update_idletasks()
