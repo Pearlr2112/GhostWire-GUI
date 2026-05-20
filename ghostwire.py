@@ -178,15 +178,28 @@ def fetch_contacts(user_id: str) -> list[dict]:
 
 
 def fetch_messages(my_id: str, their_id: str) -> list[dict]:
-    rows = sb_request("GET", "messages", params={
-        "or": f"(and(sender_id.eq.{my_id},receiver_id.eq.{their_id}),and(sender_id.eq.{their_id},receiver_id.eq.{my_id}))",
+    # Fetch messages I sent to them
+    sent = sb_request("GET", "messages", params={
+        "sender_id": f"eq.{my_id}",
+        "receiver_id": f"eq.{their_id}",
         "order": "created_at.asc",
         "select": "sender_id,morse,original,created_at",
-    })
-    if not rows:
-        return []
+    }) or []
+
+    # Fetch messages they sent to me
+    recv = sb_request("GET", "messages", params={
+        "sender_id": f"eq.{their_id}",
+        "receiver_id": f"eq.{my_id}",
+        "order": "created_at.asc",
+        "select": "sender_id,morse,original,created_at",
+    }) or []
+
+    # Merge and sort by created_at
+    all_msgs = sent + recv
+    all_msgs.sort(key=lambda r: r.get("created_at", ""))
+
     result = []
-    for r in rows:
+    for r in all_msgs:
         side = "sent" if r["sender_id"] == my_id else "recv"
         result.append({"side": side, "morse": r["morse"], "original": r["original"]})
     return result
