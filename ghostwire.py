@@ -5,20 +5,27 @@ Powered by Supabase for real-time messaging and invite-code contacts.
 NOTE: Do not commit SUPABASE_KEY to public repositories.
 """
 
-import os
-import sys
-import hashlib
 import base64
-import time
+import hashlib
+import os
 import random
 import string
 import threading
-import subprocess
+import time
 import tkinter as tk
 from tkinter import messagebox
 
+try:
+    import cv2
+    from PIL import Image, ImageTk
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
 # ── Supabase (REST only, no extra SDK needed) ─────────────────────────────────
 import urllib.request
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 import urllib.parse
 import json
 
@@ -51,16 +58,6 @@ def sb_request(method: str, path: str, data: dict = None, params: dict = None) -
         return None
 
 
-# ── Optional video call dependencies ─────────────────────────────────────────
-try:
-    import cv2
-    from PIL import Image, ImageTk
-    import numpy
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 #  Morse utilities
 # ──────────────────────────────────────────────────────────────────────────────
@@ -87,7 +84,6 @@ def to_morse(text: str) -> str:
 
 
 def from_morse(morse: str) -> str:
-    """Convert morse string back to text. Handles empty input gracefully."""
     if not morse or not morse.strip():
         return ''
     words = morse.strip().split(' / ')
@@ -95,7 +91,7 @@ def from_morse(morse: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Auth helpers (Supabase-backed)
+#  Auth helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _hash_password(password: str, salt: bytes) -> str:
@@ -152,18 +148,11 @@ def redeem_invite_code(code: str, my_user_id: str) -> tuple[bool, str]:
     their_id = row["created_by"]
     if their_id == my_user_id:
         return False, "You can't add yourself."
-
-    # Mark code as used
     sb_request("PATCH", f"invite_codes?code=eq.{code}", {"used": True})
-
-    # Look up their username
     user_rows = sb_request("GET", "users", params={"id": f"eq.{their_id}", "select": "username"})
     their_name = user_rows[0]["username"] if user_rows else "Unknown"
-
-    # Create contact relationship (both directions)
     sb_request("POST", "contacts", {"user_id": my_user_id, "contact_id": their_id})
     sb_request("POST", "contacts", {"user_id": their_id,   "contact_id": my_user_id})
-
     return True, their_name
 
 
@@ -196,17 +185,14 @@ def fetch_messages(my_id: str, their_id: str) -> list[dict]:
         "order": "created_at.asc",
         "select": "sender_id,morse,original,created_at",
     }) or []
-
     recv = sb_request("GET", "messages", params={
         "sender_id": f"eq.{their_id}",
         "receiver_id": f"eq.{my_id}",
         "order": "created_at.asc",
         "select": "sender_id,morse,original,created_at",
     }) or []
-
     all_msgs = sent + recv
     all_msgs.sort(key=lambda r: r.get("created_at", ""))
-
     result = []
     for r in all_msgs:
         side = "sent" if r["sender_id"] == my_id else "recv"
@@ -225,11 +211,10 @@ def send_message(sender_id: str, receiver_id: str, morse: str, original: str) ->
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Call helpers (Supabase-backed)
+#  Call helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def db_create_call(caller_id: str, receiver_id: str) -> str | None:
-    """Insert a call row, return its UUID."""
     result = sb_request("POST", "calls", {
         "caller_id": caller_id,
         "receiver_id": receiver_id,
@@ -242,7 +227,6 @@ def db_create_call(caller_id: str, receiver_id: str) -> str | None:
 
 
 def db_get_incoming_call(user_id: str) -> dict | None:
-    """Return the first ringing call where I am the receiver."""
     rows = sb_request("GET", "calls", params={
         "receiver_id": f"eq.{user_id}",
         "status":      "eq.ringing",
@@ -263,7 +247,6 @@ def db_push_frame(call_id: str, sender_id: str, frame_b64: str) -> None:
         "sender_id":  sender_id,
         "frame_data": frame_b64,
     })
-    # Prune old frames for this sender (keep last 5) to avoid DB bloat
     rows = sb_request("GET", "call_frames", params={
         "call_id":   f"eq.{call_id}",
         "sender_id": f"eq.{sender_id}",
@@ -276,7 +259,6 @@ def db_push_frame(call_id: str, sender_id: str, frame_b64: str) -> None:
 
 
 def db_get_latest_remote_frame(call_id: str, remote_id: str) -> str | None:
-    """Return the most recent base64 frame from the remote party."""
     rows = sb_request("GET", "call_frames", params={
         "call_id":   f"eq.{call_id}",
         "sender_id": f"eq.{remote_id}",
@@ -613,10 +595,8 @@ class InviteDialog(tk.Toplevel):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class IncomingCallDialog(tk.Toplevel):
-    """Pops up when someone is calling you."""
 
-    def __init__(self, master, call_id: str, caller_name: str,
-                 on_accept, on_decline):
+    def __init__(self, master, call_id: str, caller_name: str, on_accept, on_decline):
         super().__init__(master)
         self.title('Incoming Call')
         self.configure(bg=BG_PANEL)
@@ -691,10 +671,6 @@ class IncomingCallDialog(tk.Toplevel):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class CallWindow(tk.Toplevel):
-    """
-    Full call UI — shows remote video (large), local video (picture-in-picture),
-    and a hang-up button. Streams frames via Supabase.
-    """
 
     FRAME_INTERVAL_MS = 200
     POLL_INTERVAL_MS  = 250
@@ -811,17 +787,13 @@ class CallWindow(tk.Toplevel):
         ret, frame = self._cap.read()
         if not ret:
             return
-
         frame = cv2.flip(frame, 1)
-
         pip_frame = cv2.resize(frame, (160, 120))
         self._show_frame_on_canvas(pip_frame, self.pip_canvas,
                                    self._pip_placeholder, 160, 120)
-
         frame_small = cv2.resize(frame, (320, 240))
         _, buf = cv2.imencode('.jpg', frame_small, [cv2.IMWRITE_JPEG_QUALITY, 60])
         b64 = base64.b64encode(buf.tobytes()).decode()
-
         try:
             db_push_frame(self._call_id, self._my_id, b64)
         except Exception as e:
@@ -841,14 +813,14 @@ class CallWindow(tk.Toplevel):
         if not b64:
             return
         try:
-            raw = base64.b64decode(b64)
-            img = Image.frombytes(
-                'RGB', (320, 240),
-                cv2.cvtColor(
-                    cv2.imdecode(numpy.frombuffer(raw, numpy.uint8), cv2.IMREAD_COLOR),
-                    cv2.COLOR_BGR2RGB
-                ).tobytes()
-            )
+            import numpy as np
+            raw   = base64.b64decode(b64)
+            img   = Image.frombytes('RGB', (320, 240),
+                                    cv2.cvtColor(
+                                        cv2.imdecode(
+                                            np.frombuffer(raw, np.uint8),
+                                            cv2.IMREAD_COLOR),
+                                        cv2.COLOR_BGR2RGB).tobytes())
             w = self.remote_canvas.winfo_width()  or 720
             h = self.remote_canvas.winfo_height() or 440
             img = img.resize((w, h), Image.LANCZOS)
@@ -936,14 +908,13 @@ class MorseChatApp(tk.Tk):
         self.contacts  = []
         self.histories = {}
         self.active_contact = None
-        # Call state
-        self._active_call           = None
+        self._active_call = None
         self._seen_incoming_call_id = None
         self._build_ui()
         self._reload_contacts()
         self._start_polling()
 
-    # ── Polling for new messages ───────────────────────────────────────────────
+    # ── Polling ───────────────────────────────────────────────────────────────
 
     def _start_polling(self):
         self._poll()
@@ -951,28 +922,8 @@ class MorseChatApp(tk.Tk):
     def _poll(self):
         if self.active_contact:
             self._refresh_messages()
-        self._check_all_contacts_for_notifications()
         self._check_incoming_calls()
         self._poll_job = self.after(3000, self._poll)
-
-    def _check_all_contacts_for_notifications(self):
-        def _fetch():
-            for contact in self.contacts:
-                msgs = fetch_messages(self._user_id, contact['id'])
-                old = self.histories.get(contact['name'], [])
-                new_msgs = msgs[len(old):]
-                for msg in new_msgs:
-                    if msg['side'] == 'recv':
-                        self._notify(contact['name'], msg['original'])
-                if len(msgs) != len(old):
-                    self.histories[contact['name']] = msgs
-        threading.Thread(target=_fetch, daemon=True).start()
-
-    def _notify(self, sender: str, message: str):
-        subprocess.run([
-            'osascript', '-e',
-            f'display notification "{message}" with title "GhostWire" subtitle "{sender}"'
-        ])
 
     def _refresh_messages(self):
         if not self.active_contact:
@@ -1160,7 +1111,7 @@ class MorseChatApp(tk.Tk):
                                  font=('Helvetica', 9), bg=BG_PANEL, fg=TEXT_MORSE)
         self.hdr_sub.pack(anchor='w')
 
-        # Call button in header (right side)
+        # ── Call button ───────────────────────────────────────────────────────
         self._call_btn = tk.Button(
             self.chat_header, text='📞',
             font=('Helvetica', 14), bg=BG_PANEL, fg=TEAL,
@@ -1184,9 +1135,9 @@ class MorseChatApp(tk.Tk):
         self.msg_frame.bind('<Configure>', self._on_frame_configure)
         self.msg_canvas.bind('<Configure>', self._on_canvas_configure)
 
-        self.bind_all('<MouseWheel>', self._on_mousewheel)
-        self.bind_all('<Button-4>', lambda e: self.msg_canvas.yview_scroll(-3, 'units'))
-        self.bind_all('<Button-5>', lambda e: self.msg_canvas.yview_scroll(3, 'units'))
+        self.msg_canvas.bind_all('<MouseWheel>', self._on_mousewheel)
+        self.msg_canvas.bind_all('<Button-4>',   lambda e: self.msg_canvas.yview_scroll(-1, 'units'))
+        self.msg_canvas.bind_all('<Button-5>',   lambda e: self.msg_canvas.yview_scroll(1, 'units'))
 
         inp = tk.Frame(pane, bg=BG_PANEL, pady=12, padx=16)
         inp.grid(row=2, column=0, columnspan=2, sticky='ew')
@@ -1330,39 +1281,9 @@ class MorseChatApp(tk.Tk):
             tk.Label(meta_row, text=ts, font=('Helvetica', 8),
                      bg=BG_DARK, fg=TEXT_MORSE).pack(side='left', padx=(8, 0))
 
-        self._bind_scroll_to_widget(outer)
-        self._bind_scroll_to_widget(inner)
-        self._bind_scroll_to_widget(bubble)
-        self._bind_scroll_to_widget(meta_row)
+    # ── Call integration ──────────────────────────────────────────────────────
 
-    def _bind_scroll_to_widget(self, widget: tk.Widget) -> None:
-        widget.bind('<MouseWheel>', self._on_mousewheel)
-        widget.bind('<Button-4>',   lambda e: self.msg_canvas.yview_scroll(-3, 'units'))
-        widget.bind('<Button-5>',   lambda e: self.msg_canvas.yview_scroll(3, 'units'))
-
-    # ── Canvas helpers ────────────────────────────────────────────────────────
-
-    def _on_frame_configure(self, *_) -> None:
-        self.msg_canvas.configure(scrollregion=self.msg_canvas.bbox('all'))
-
-    def _on_canvas_configure(self, event) -> None:
-        self.msg_canvas.itemconfig(self.msg_window, width=event.width)
-
-    def _on_mousewheel(self, event) -> None:
-        if sys.platform == 'darwin':
-            self.msg_canvas.yview_scroll(-event.delta, 'units')
-        else:
-            self.msg_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
-
-    def _scroll_bottom(self) -> None:
-        self.update_idletasks()
-        self.msg_canvas.update_idletasks()
-        self.msg_canvas.yview_moveto(1.0)
-
-    # ── Call methods ──────────────────────────────────────────────────────────
-
-    def _start_call(self) -> None:
-        """Called when the local user clicks the 📞 button."""
+    def _start_call(self):
         if not self.active_contact:
             return
         if self._active_call:
@@ -1401,8 +1322,7 @@ class MorseChatApp(tk.Tk):
 
         threading.Thread(target=_do, daemon=True).start()
 
-    def _check_incoming_calls(self) -> None:
-        """Polled every 3 s to detect incoming calls."""
+    def _check_incoming_calls(self):
         if self._active_call:
             return
 
@@ -1427,14 +1347,28 @@ class MorseChatApp(tk.Tk):
 
         threading.Thread(target=_do, daemon=True).start()
 
-    def _open_call_window(self, call_id: str, remote_id: str, remote_name: str) -> None:
-        """Open the CallWindow and track it."""
+    def _open_call_window(self, call_id: str, remote_id: str, remote_name: str):
         self._active_call = call_id
 
         def _on_end():
             self._active_call = None
 
         CallWindow(self, call_id, self._user_id, remote_id, remote_name, _on_end)
+
+    # ── Canvas helpers ────────────────────────────────────────────────────────
+
+    def _on_frame_configure(self, *_) -> None:
+        self.msg_canvas.configure(scrollregion=self.msg_canvas.bbox('all'))
+
+    def _on_canvas_configure(self, event) -> None:
+        self.msg_canvas.itemconfig(self.msg_window, width=event.width)
+
+    def _on_mousewheel(self, event) -> None:
+        self.msg_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+
+    def _scroll_bottom(self) -> None:
+        self.update_idletasks()
+        self.msg_canvas.yview_moveto(1.0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
