@@ -6,12 +6,14 @@ NOTE: Do not commit SUPABASE_KEY to public repositories.
 """
 
 import os
+import sys
 import hashlib
 import base64
 import time
 import random
 import string
 import threading
+import subprocess
 import tkinter as tk
 from tkinter import messagebox
 
@@ -47,6 +49,16 @@ def sb_request(method: str, path: str, data: dict = None, params: dict = None) -
     except Exception as e:
         print(f"[Supabase] {method} {path} → {e}")
         return None
+
+
+# ── Optional video call dependencies ─────────────────────────────────────────
+try:
+    import cv2
+    from PIL import Image, ImageTk
+    import numpy
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -178,7 +190,6 @@ def fetch_contacts(user_id: str) -> list[dict]:
 
 
 def fetch_messages(my_id: str, their_id: str) -> list[dict]:
-    # Fetch messages I sent to them
     sent = sb_request("GET", "messages", params={
         "sender_id": f"eq.{my_id}",
         "receiver_id": f"eq.{their_id}",
@@ -186,7 +197,6 @@ def fetch_messages(my_id: str, their_id: str) -> list[dict]:
         "select": "sender_id,morse,original,created_at",
     }) or []
 
-    # Fetch messages they sent to me
     recv = sb_request("GET", "messages", params={
         "sender_id": f"eq.{their_id}",
         "receiver_id": f"eq.{my_id}",
@@ -194,7 +204,6 @@ def fetch_messages(my_id: str, their_id: str) -> list[dict]:
         "select": "sender_id,morse,original,created_at",
     }) or []
 
-    # Merge and sort by created_at
     all_msgs = sent + recv
     all_msgs.sort(key=lambda r: r.get("created_at", ""))
 
@@ -213,6 +222,87 @@ def send_message(sender_id: str, receiver_id: str, morse: str, original: str) ->
         "original": original,
     })
     return result is not None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Call helpers (Supabase-backed)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def db_create_call(caller_id: str, receiver_id: str) -> str | None:
+    """Insert a call row, return its UUID."""
+    result = sb_request("POST", "calls", {
+        "caller_id": caller_id,
+        "receiver_id": receiver_id,
+        "status": "ringing",
+    })
+    if result:
+        row = result[0] if isinstance(result, list) else result
+        return row.get("id")
+    return None
+
+
+def db_get_incoming_call(user_id: str) -> dict | None:
+    """Return the first ringing call where I am the receiver."""
+    rows = sb_request("GET", "calls", params={
+        "receiver_id": f"eq.{user_id}",
+        "status":      "eq.ringing",
+        "select":      "id,caller_id,created_at",
+        "order":       "created_at.desc",
+        "limit":       "1",
+    })
+    return rows[0] if rows else None
+
+
+def db_update_call_status(call_id: str, status: str) -> None:
+    sb_request("PATCH", f"calls?id=eq.{call_id}", {"status": status})
+
+
+def db_push_frame(call_id: str, sender_id: str, frame_b64: str) -> None:
+    sb_request("POST", "call_frames", {
+        "call_id":    call_id,
+        "sender_id":  sender_id,
+        "frame_data": frame_b64,
+    })
+    # Prune old frames for this sender (keep last 5) to avoid DB bloat
+    rows = sb_request("GET", "call_frames", params={
+        "call_id":   f"eq.{call_id}",
+        "sender_id": f"eq.{sender_id}",
+        "select":    "id,created_at",
+        "order":     "created_at.desc",
+    }) or []
+    if len(rows) > 5:
+        for old in rows[5:]:
+            sb_request("DELETE", f"call_frames?id=eq.{old['id']}")
+
+
+def db_get_latest_remote_frame(call_id: str, remote_id: str) -> str | None:
+    """Return the most recent base64 frame from the remote party."""
+    rows = sb_request("GET", "call_frames", params={
+        "call_id":   f"eq.{call_id}",
+        "sender_id": f"eq.{remote_id}",
+        "select":    "frame_data,created_at",
+        "order":     "created_at.desc",
+        "limit":     "1",
+    })
+    return rows[0]["frame_data"] if rows else None
+
+
+def db_is_call_active(call_id: str) -> bool:
+    rows = sb_request("GET", "calls", params={
+        "id":     f"eq.{call_id}",
+        "select": "status",
+    })
+    if not rows:
+        return False
+    return rows[0].get("status") in ("ringing", "active")
+
+
+def db_get_caller_name(caller_id: str) -> str:
+    rows = sb_request("GET", "users", params={
+        "id":     f"eq.{caller_id}",
+        "select": "username",
+    })
+    return rows[0]["username"] if rows else "Unknown"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -455,7 +545,6 @@ class InviteDialog(tk.Toplevel):
 
         divider(pad).pack(fill='x', pady=(0, 16))
 
-        # My code section
         tk.Label(pad, text='YOUR INVITE CODE', font=('Helvetica', 8, 'bold'),
                  bg=BG_PANEL, fg=TEXT_MORSE).pack(anchor='w')
 
@@ -477,7 +566,6 @@ class InviteDialog(tk.Toplevel):
 
         divider(pad).pack(fill='x', pady=(0, 16))
 
-        # Enter a code
         tk.Label(pad, text="ENTER A FRIEND'S CODE", font=('Helvetica', 8, 'bold'),
                  bg=BG_PANEL, fg=TEXT_MORSE).pack(anchor='w')
 
@@ -521,6 +609,312 @@ class InviteDialog(tk.Toplevel):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  Incoming call dialog
+# ──────────────────────────────────────────────────────────────────────────────
+
+class IncomingCallDialog(tk.Toplevel):
+    """Pops up when someone is calling you."""
+
+    def __init__(self, master, call_id: str, caller_name: str,
+                 on_accept, on_decline):
+        super().__init__(master)
+        self.title('Incoming Call')
+        self.configure(bg=BG_PANEL)
+        self.resizable(False, False)
+        self.grab_set()
+        self.attributes('-topmost', True)
+        self._call_id    = call_id
+        self._on_accept  = on_accept
+        self._on_decline = on_decline
+        self._build(caller_name)
+        self.geometry('340x220')
+        self._centre()
+
+    def _centre(self):
+        self.update_idletasks()
+        x = self.master.winfo_x() + (self.master.winfo_width()  - 340) // 2
+        y = self.master.winfo_y() + (self.master.winfo_height() - 220) // 2
+        self.geometry(f'340x220+{x}+{y}')
+
+    def _build(self, caller_name: str):
+        pad = tk.Frame(self, bg=BG_PANEL, padx=30, pady=24)
+        pad.pack(fill='both', expand=True)
+
+        ring = tk.Canvas(pad, width=60, height=60, bg=BG_PANEL, highlightthickness=0)
+        ring.pack()
+        ring.create_oval(5, 5, 55, 55, fill=TEAL, outline='')
+        ring.create_text(30, 30, text='📞', font=('Helvetica', 20))
+        self._animate_ring(ring)
+
+        tk.Label(pad, text=f'{caller_name}', font=('Helvetica', 15, 'bold'),
+                 bg=BG_PANEL, fg=TEXT_PRI).pack(pady=(10, 2))
+        tk.Label(pad, text='Incoming GhostWire call…',
+                 font=('Helvetica', 9), bg=BG_PANEL, fg=TEXT_SEC).pack()
+
+        btns = tk.Frame(pad, bg=BG_PANEL)
+        btns.pack(pady=(18, 0))
+
+        dec = tk.Button(btns, text='✕  Decline', font=('Helvetica', 10, 'bold'),
+                        bg=RED_ERR, fg='white', activebackground='#c0455a',
+                        relief='flat', cursor='hand2', padx=16, pady=8,
+                        command=self._decline)
+        dec.pack(side='left', padx=(0, 12))
+
+        acc = tk.Button(btns, text='✓  Accept', font=('Helvetica', 10, 'bold'),
+                        bg=TEAL, fg='#0b0d14', activebackground='#25b88a',
+                        relief='flat', cursor='hand2', padx=16, pady=8,
+                        command=self._accept)
+        acc.pack(side='left')
+
+    def _animate_ring(self, canvas, step=0):
+        colours = [TEAL, '#25b88a', TEAL, '#1fa077']
+        canvas.configure(bg=colours[step % len(colours)])
+        self._anim_job = self.after(400, lambda: self._animate_ring(canvas, step + 1))
+
+    def _accept(self):
+        if hasattr(self, '_anim_job'):
+            self.after_cancel(self._anim_job)
+        db_update_call_status(self._call_id, 'active')
+        self.destroy()
+        self._on_accept(self._call_id)
+
+    def _decline(self):
+        if hasattr(self, '_anim_job'):
+            self.after_cancel(self._anim_job)
+        db_update_call_status(self._call_id, 'declined')
+        self.destroy()
+        self._on_decline()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Call window
+# ──────────────────────────────────────────────────────────────────────────────
+
+class CallWindow(tk.Toplevel):
+    """
+    Full call UI — shows remote video (large), local video (picture-in-picture),
+    and a hang-up button. Streams frames via Supabase.
+    """
+
+    FRAME_INTERVAL_MS = 200
+    POLL_INTERVAL_MS  = 250
+
+    def __init__(self, master, call_id: str, my_id: str, remote_id: str,
+                 remote_name: str, on_end):
+        super().__init__(master)
+        self.title(f'Call with {remote_name}')
+        self.configure(bg='#000000')
+        self.geometry('720x500')
+        self.minsize(480, 360)
+        self.attributes('-topmost', True)
+
+        self._call_id      = call_id
+        self._my_id        = my_id
+        self._remote_id    = remote_id
+        self._remote_name  = remote_name
+        self._on_end       = on_end
+        self._running      = True
+        self._cap          = None
+        self._local_photo  = None
+        self._remote_photo = None
+
+        self._build_ui()
+
+        if CV2_AVAILABLE:
+            self._open_camera()
+            self._schedule_send()
+        else:
+            self._show_no_cv2()
+
+        self._schedule_recv()
+        self._schedule_status_check()
+        self.protocol('WM_DELETE_WINDOW', self._hang_up)
+
+    def _build_ui(self):
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        self.remote_canvas = tk.Canvas(self, bg='#111111',
+                                       highlightthickness=0, cursor='none')
+        self.remote_canvas.grid(row=0, column=0, sticky='nsew')
+
+        self._remote_placeholder = self.remote_canvas.create_text(
+            360, 220, text=f'Connecting to {self._remote_name}…',
+            fill=TEXT_SEC, font=('Helvetica', 13))
+
+        self.pip_canvas = tk.Canvas(self, width=160, height=120,
+                                    bg='#222222', highlightthickness=2,
+                                    highlightbackground=ACCENT)
+        self.pip_canvas.place(relx=1.0, rely=1.0, anchor='se', x=-60, y=-60)
+
+        self._pip_placeholder = self.pip_canvas.create_text(
+            80, 60, text='Camera…', fill=TEXT_MORSE, font=('Helvetica', 9))
+
+        bar = tk.Frame(self, bg=BG_DARK, pady=10)
+        bar.grid(row=1, column=0, sticky='ew')
+
+        self._status_var = tk.StringVar(value='🟢  Connected')
+        tk.Label(bar, textvariable=self._status_var,
+                 font=('Helvetica', 10), bg=BG_DARK, fg=TEAL).pack(side='left', padx=16)
+
+        tk.Label(bar, text=f'📞  {self._remote_name}',
+                 font=('Helvetica', 10, 'bold'), bg=BG_DARK, fg=TEXT_PRI).pack(side='left')
+
+        hangup = tk.Button(bar, text='⬛  End Call',
+                           font=('Helvetica', 10, 'bold'),
+                           bg=RED_ERR, fg='white', activebackground='#c0455a',
+                           relief='flat', cursor='hand2', padx=18, pady=6,
+                           command=self._hang_up)
+        hangup.pack(side='right', padx=16)
+
+        self._mute_var = tk.BooleanVar(value=False)
+        mute_btn = tk.Button(bar, text='🎤  Mute',
+                             font=('Helvetica', 9),
+                             bg=BG_CARD, fg=TEXT_SEC, activebackground=ACCENT,
+                             relief='flat', cursor='hand2', padx=12, pady=6,
+                             command=lambda: self._toggle_mute(mute_btn))
+        mute_btn.pack(side='right', padx=(0, 6))
+
+    def _toggle_mute(self, btn):
+        self._mute_var.set(not self._mute_var.get())
+        if self._mute_var.get():
+            btn.config(text='🔇  Unmute', bg=RED_ERR, fg='white')
+        else:
+            btn.config(text='🎤  Mute', bg=BG_CARD, fg=TEXT_SEC)
+
+    def _show_no_cv2(self):
+        self.remote_canvas.itemconfig(
+            self._remote_placeholder,
+            text='opencv-python not installed.\nRun: pip install opencv-python pillow',
+            font=('Helvetica', 12))
+
+    def _open_camera(self):
+        def _init():
+            cap = cv2.VideoCapture(0)
+            if cap.isOpened():
+                self._cap = cap
+            else:
+                self.after(0, lambda: self.remote_canvas.itemconfig(
+                    self._remote_placeholder,
+                    text='Could not open webcam.\nCheck camera permissions.'))
+        threading.Thread(target=_init, daemon=True).start()
+
+    def _schedule_send(self):
+        if not self._running:
+            return
+        threading.Thread(target=self._capture_and_send, daemon=True).start()
+        self._send_job = self.after(self.FRAME_INTERVAL_MS, self._schedule_send)
+
+    def _capture_and_send(self):
+        if not self._cap or not self._cap.isOpened():
+            return
+        ret, frame = self._cap.read()
+        if not ret:
+            return
+
+        frame = cv2.flip(frame, 1)
+
+        pip_frame = cv2.resize(frame, (160, 120))
+        self._show_frame_on_canvas(pip_frame, self.pip_canvas,
+                                   self._pip_placeholder, 160, 120)
+
+        frame_small = cv2.resize(frame, (320, 240))
+        _, buf = cv2.imencode('.jpg', frame_small, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        b64 = base64.b64encode(buf.tobytes()).decode()
+
+        try:
+            db_push_frame(self._call_id, self._my_id, b64)
+        except Exception as e:
+            print(f'[Call] frame send error: {e}')
+
+    def _schedule_recv(self):
+        if not self._running:
+            return
+        threading.Thread(target=self._fetch_remote_frame, daemon=True).start()
+        self._recv_job = self.after(self.POLL_INTERVAL_MS, self._schedule_recv)
+
+    def _fetch_remote_frame(self):
+        try:
+            b64 = db_get_latest_remote_frame(self._call_id, self._remote_id)
+        except Exception:
+            return
+        if not b64:
+            return
+        try:
+            raw = base64.b64decode(b64)
+            img = Image.frombytes(
+                'RGB', (320, 240),
+                cv2.cvtColor(
+                    cv2.imdecode(numpy.frombuffer(raw, numpy.uint8), cv2.IMREAD_COLOR),
+                    cv2.COLOR_BGR2RGB
+                ).tobytes()
+            )
+            w = self.remote_canvas.winfo_width()  or 720
+            h = self.remote_canvas.winfo_height() or 440
+            img = img.resize((w, h), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self.after(0, lambda p=photo: self._paint_remote(p))
+        except Exception as e:
+            print(f'[Call] frame decode error: {e}')
+
+    def _paint_remote(self, photo):
+        self._remote_photo = photo
+        self.remote_canvas.delete('all')
+        self.remote_canvas.create_image(0, 0, anchor='nw', image=photo)
+
+    def _show_frame_on_canvas(self, bgr_frame, canvas, placeholder_id, w, h):
+        try:
+            rgb   = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+            img   = Image.fromarray(rgb)
+            photo = ImageTk.PhotoImage(img)
+
+            def _draw(p=photo, c=canvas, ph=placeholder_id):
+                self._local_photo = p
+                c.delete(ph)
+                c.create_image(0, 0, anchor='nw', image=p)
+
+            self.after(0, _draw)
+        except Exception as e:
+            print(f'[Call] local render error: {e}')
+
+    def _schedule_status_check(self):
+        if not self._running:
+            return
+        def _check():
+            if not db_is_call_active(self._call_id):
+                self.after(0, self._remote_hung_up)
+        threading.Thread(target=_check, daemon=True).start()
+        self._status_job = self.after(3000, self._schedule_status_check)
+
+    def _remote_hung_up(self):
+        self._status_var.set('🔴  Call ended by remote')
+        self.after(2000, self._close)
+
+    def _hang_up(self):
+        self._running = False
+        for attr in ('_send_job', '_recv_job', '_status_job'):
+            job = getattr(self, attr, None)
+            if job:
+                self.after_cancel(job)
+        if self._cap:
+            self._cap.release()
+        try:
+            db_update_call_status(self._call_id, 'ended')
+        except Exception:
+            pass
+        self._close()
+
+    def _close(self):
+        self._running = False
+        if self._cap:
+            try: self._cap.release()
+            except Exception: pass
+        self._on_end()
+        try: self.destroy()
+        except Exception: pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  Main chat application
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -542,6 +936,9 @@ class MorseChatApp(tk.Tk):
         self.contacts  = []
         self.histories = {}
         self.active_contact = None
+        # Call state
+        self._active_call           = None
+        self._seen_incoming_call_id = None
         self._build_ui()
         self._reload_contacts()
         self._start_polling()
@@ -554,7 +951,28 @@ class MorseChatApp(tk.Tk):
     def _poll(self):
         if self.active_contact:
             self._refresh_messages()
+        self._check_all_contacts_for_notifications()
+        self._check_incoming_calls()
         self._poll_job = self.after(3000, self._poll)
+
+    def _check_all_contacts_for_notifications(self):
+        def _fetch():
+            for contact in self.contacts:
+                msgs = fetch_messages(self._user_id, contact['id'])
+                old = self.histories.get(contact['name'], [])
+                new_msgs = msgs[len(old):]
+                for msg in new_msgs:
+                    if msg['side'] == 'recv':
+                        self._notify(contact['name'], msg['original'])
+                if len(msgs) != len(old):
+                    self.histories[contact['name']] = msgs
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _notify(self, sender: str, message: str):
+        subprocess.run([
+            'osascript', '-e',
+            f'display notification "{message}" with title "GhostWire" subtitle "{sender}"'
+        ])
 
     def _refresh_messages(self):
         if not self.active_contact:
@@ -589,7 +1007,6 @@ class MorseChatApp(tk.Tk):
                 self.histories[c['name']] = []
             c['color'] = CONTACT_COLORS[hash(c['name']) % len(CONTACT_COLORS)]
 
-        # Rebuild contacts list in sidebar
         for w in self._contacts_frame.winfo_children():
             w.destroy()
         self.contact_btns = {}
@@ -743,6 +1160,14 @@ class MorseChatApp(tk.Tk):
                                  font=('Helvetica', 9), bg=BG_PANEL, fg=TEXT_MORSE)
         self.hdr_sub.pack(anchor='w')
 
+        # Call button in header (right side)
+        self._call_btn = tk.Button(
+            self.chat_header, text='📞',
+            font=('Helvetica', 14), bg=BG_PANEL, fg=TEAL,
+            activebackground=BG_HOVER, relief='flat', cursor='hand2',
+            padx=8, pady=4, command=self._start_call)
+        self._call_btn.pack(side='right', padx=(0, 4))
+
         divider(pane).grid(row=0, column=0, columnspan=2, sticky='sew')
 
         self.msg_canvas = tk.Canvas(pane, bg=BG_DARK, highlightthickness=0, bd=0)
@@ -759,10 +1184,9 @@ class MorseChatApp(tk.Tk):
         self.msg_frame.bind('<Configure>', self._on_frame_configure)
         self.msg_canvas.bind('<Configure>', self._on_canvas_configure)
 
-        # Cross-platform mouse wheel scrolling (Windows/macOS use MouseWheel; Linux uses Button-4/5)
-        self.msg_canvas.bind_all('<MouseWheel>', self._on_mousewheel)
-        self.msg_canvas.bind_all('<Button-4>',   lambda e: self.msg_canvas.yview_scroll(-1, 'units'))
-        self.msg_canvas.bind_all('<Button-5>',   lambda e: self.msg_canvas.yview_scroll(1, 'units'))
+        self.bind_all('<MouseWheel>', self._on_mousewheel)
+        self.bind_all('<Button-4>', lambda e: self.msg_canvas.yview_scroll(-3, 'units'))
+        self.bind_all('<Button-5>', lambda e: self.msg_canvas.yview_scroll(3, 'units'))
 
         inp = tk.Frame(pane, bg=BG_PANEL, pady=12, padx=16)
         inp.grid(row=2, column=0, columnspan=2, sticky='ew')
@@ -802,7 +1226,6 @@ class MorseChatApp(tk.Tk):
                 self._poll_job = None
             for w in self.winfo_children():
                 w.destroy()
-            # Reset grid weights for auth screen (full-width single column)
             self.grid_columnconfigure(0, weight=1)
             self.grid_columnconfigure(1, weight=0)
             AuthScreen(self, self._on_login)
@@ -827,7 +1250,6 @@ class MorseChatApp(tk.Tk):
         self.hdr_canvas.create_text(20, 20, text=contact['initials'],
                                      fill='#d6d3e8', font=('Helvetica', 10, 'bold'))
 
-        # Load messages in background
         def _fetch():
             msgs = fetch_messages(self._user_id, contact['id'])
             self.histories[contact['name']] = msgs
@@ -908,6 +1330,16 @@ class MorseChatApp(tk.Tk):
             tk.Label(meta_row, text=ts, font=('Helvetica', 8),
                      bg=BG_DARK, fg=TEXT_MORSE).pack(side='left', padx=(8, 0))
 
+        self._bind_scroll_to_widget(outer)
+        self._bind_scroll_to_widget(inner)
+        self._bind_scroll_to_widget(bubble)
+        self._bind_scroll_to_widget(meta_row)
+
+    def _bind_scroll_to_widget(self, widget: tk.Widget) -> None:
+        widget.bind('<MouseWheel>', self._on_mousewheel)
+        widget.bind('<Button-4>',   lambda e: self.msg_canvas.yview_scroll(-3, 'units'))
+        widget.bind('<Button-5>',   lambda e: self.msg_canvas.yview_scroll(3, 'units'))
+
     # ── Canvas helpers ────────────────────────────────────────────────────────
 
     def _on_frame_configure(self, *_) -> None:
@@ -917,7 +1349,6 @@ class MorseChatApp(tk.Tk):
         self.msg_canvas.itemconfig(self.msg_window, width=event.width)
 
     def _on_mousewheel(self, event) -> None:
-        # Windows/macOS: event.delta is ±120 multiples; Linux uses Button-4/5 bindings above
         if sys.platform == 'darwin':
             self.msg_canvas.yview_scroll(-event.delta, 'units')
         else:
@@ -925,7 +1356,85 @@ class MorseChatApp(tk.Tk):
 
     def _scroll_bottom(self) -> None:
         self.update_idletasks()
+        self.msg_canvas.update_idletasks()
         self.msg_canvas.yview_moveto(1.0)
+
+    # ── Call methods ──────────────────────────────────────────────────────────
+
+    def _start_call(self) -> None:
+        """Called when the local user clicks the 📞 button."""
+        if not self.active_contact:
+            return
+        if self._active_call:
+            messagebox.showinfo('Call in progress', 'You already have an active call.')
+            return
+        if not CV2_AVAILABLE:
+            messagebox.showerror(
+                'Missing dependency',
+                'Install opencv-python and pillow:\n\npip install opencv-python pillow')
+            return
+
+        their_id   = self.active_contact['id']
+        their_name = self.active_contact['name']
+
+        def _do():
+            call_id = db_create_call(self._user_id, their_id)
+            if not call_id:
+                self.after(0, lambda: messagebox.showerror('Error', 'Could not start call.'))
+                return
+            for _ in range(30):
+                time.sleep(1)
+                rows = sb_request("GET", "calls", params={
+                    "id": f"eq.{call_id}", "select": "status"})
+                if rows:
+                    status = rows[0].get('status')
+                    if status == 'active':
+                        self.after(0, lambda cid=call_id: self._open_call_window(
+                            cid, their_id, their_name))
+                        return
+                    if status in ('declined', 'ended'):
+                        self.after(0, lambda: messagebox.showinfo(
+                            'Call', f'{their_name} declined the call.'))
+                        return
+            db_update_call_status(call_id, 'ended')
+            self.after(0, lambda: messagebox.showinfo('Call', f'{their_name} did not answer.'))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _check_incoming_calls(self) -> None:
+        """Polled every 3 s to detect incoming calls."""
+        if self._active_call:
+            return
+
+        def _do():
+            call = db_get_incoming_call(self._user_id)
+            if not call:
+                return
+            call_id = call['id']
+            if call_id == self._seen_incoming_call_id:
+                return
+            self._seen_incoming_call_id = call_id
+            caller_name = db_get_caller_name(call['caller_id'])
+
+            def _show():
+                IncomingCallDialog(
+                    self, call_id, caller_name,
+                    on_accept=lambda cid=call_id: self._open_call_window(
+                        cid, call['caller_id'], caller_name),
+                    on_decline=lambda: None,
+                )
+            self.after(0, _show)
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _open_call_window(self, call_id: str, remote_id: str, remote_name: str) -> None:
+        """Open the CallWindow and track it."""
+        self._active_call = call_id
+
+        def _on_end():
+            self._active_call = None
+
+        CallWindow(self, call_id, self._user_id, remote_id, remote_name, _on_end)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
