@@ -1321,6 +1321,7 @@ class MorseChatApp(tk.Tk):
             self.after(0, lambda: messagebox.showinfo('Call', f'{their_name} did not answer.'))
 
         threading.Thread(target=_do, daemon=True).start()
+        supabase.table("calls")
 
     def _check_incoming_calls(self):
         if self._active_call:
