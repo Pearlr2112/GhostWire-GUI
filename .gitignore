@@ -1,0 +1,9 @@
+# Ignore Python cache files
+__pycache__/
+*.pyc
+
+# Ignore editor temporary/swap files
+*.swp
+
+# Ignore your secret local environment files
+.env

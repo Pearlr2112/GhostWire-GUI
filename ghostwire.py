@@ -20,6 +20,8 @@ import time
 import tkinter as tk
 import webbrowser
 from tkinter import messagebox
+from call_history_tab import CallHistoryFrame, history_add
+from datetime import datetime
 
 # ── Supabase (REST only, no extra SDK needed) ─────────────────────────────────
 import urllib.request
@@ -838,6 +840,7 @@ class MorseChatApp(tk.Tk):
         self._build_ui()
         self._reload_contacts()
         self._start_polling()
+        self._sidebar_tab = 'chats'   # 'chats' | 'history'
 
     # ── Polling ───────────────────────────────────────────────────────────────
 
@@ -912,7 +915,7 @@ class MorseChatApp(tk.Tk):
         side = tk.Frame(self, bg=BG_PANEL, width=240)
         side.grid(row=0, column=0, sticky='nsew')
         side.grid_propagate(False)
-        side.grid_rowconfigure(2, weight=1)
+        side.grid_rowconfigure(3, weight=1)
         side.grid_columnconfigure(0, weight=1)
 
         hdr = tk.Frame(side, bg=BG_PANEL, pady=14, padx=14)
@@ -944,9 +947,24 @@ class MorseChatApp(tk.Tk):
         logout_btn.bind('<Leave>', lambda e: logout_btn.config(fg=TEXT_MORSE))
 
         divider(side).grid(row=1, column=0, sticky='ew')
+        tab_bar = tk.Frame(side, bg=BG_CARD)
+        tab_bar.grid(row=2, column=0, sticky='ew')
+        tab_bar.grid_columnconfigure(0, weight=1)
+        tab_bar.grid_columnconfigure(1, weight=1)
 
-        contacts_wrap = tk.Frame(side, bg=BG_PANEL)
-        contacts_wrap.grid(row=2, column=0, sticky='nsew', pady=6)
+        self._tab_chats_btn = tk.Button(tab_bar, text='💬  Chats', font=('Helvetica', 9, 'bold'),
+    bg=ACCENT, fg='#d6d3e8', activebackground=ACCENT_HOVER, relief='flat',
+    cursor='hand2', pady=8, command=lambda: self._switch_sidebar_tab('chats'))
+        self._tab_chats_btn.grid(row=0, column=0, sticky='ew')
+
+        self._tab_hist_btn = tk.Button(tab_bar, text='📋  Calls', font=('Helvetica', 9, 'bold'),
+    bg=BG_CARD, fg=TEXT_SEC, activebackground=BG_HOVER, relief='flat',
+    cursor='hand2', pady=8, command=lambda: self._switch_sidebar_tab('history'))
+        self._tab_hist_btn.grid(row=0, column=1, sticky='ew')
+        
+
+        self._contacts_wrap = tk.Frame(side, bg=BG_PANEL)
+        self._contacts_wrap.grid(row=3, column=0, sticky='nsew', pady=6)
 
         conv_hdr = tk.Frame(contacts_wrap, bg=BG_PANEL)
         conv_hdr.pack(fill='x', padx=10, pady=(8, 4))
@@ -1410,6 +1428,20 @@ class MorseChatApp(tk.Tk):
 def main():
     app = MorseChatApp()
     app.mainloop()
+
+def _switch_sidebar_tab(self, tab: str) -> None:
+    self._sidebar_tab = tab
+    if tab == 'chats':
+        self._tab_chats_btn.config(bg=ACCENT, fg='#d6d3e8')
+        self._tab_hist_btn.config(bg=BG_CARD, fg=TEXT_SEC)
+        self._history_panel.grid_remove()
+        self._contacts_wrap.grid(row=3, column=0, sticky='nsew', pady=6)
+    else:
+        self._tab_hist_btn.config(bg=ACCENT, fg='#d6d3e8')
+        self._tab_chats_btn.config(bg=BG_CARD, fg=TEXT_SEC)
+        self._contacts_wrap.grid_remove()
+        self._history_panel.grid(row=3, column=0, sticky='nsew')
+        self._history_panel.refresh()
 
 
 if __name__ == '__main__':
@@ -2392,7 +2424,7 @@ class MorseChatApp(tk.Tk):
         contacts_wrap = tk.Frame(side, bg=BG_PANEL)
         contacts_wrap.grid(row=2, column=0, sticky='nsew', pady=6)
 
-        conv_hdr = tk.Frame(contacts_wrap, bg=BG_PANEL)
+        conv_hdr = tk.Frame(self._contacts_wrap, bg=BG_PANEL)
         conv_hdr.pack(fill='x', padx=10, pady=(8, 4))
         tk.Label(conv_hdr, text='CONVERSATIONS',
                  font=('Helvetica', 8, 'bold'), bg=BG_PANEL,
@@ -2402,9 +2434,12 @@ class MorseChatApp(tk.Tk):
                            bg=ACCENT, hover=ACCENT_HOVER)
         add_btn.pack(side='right')
 
-        self._contacts_frame = tk.Frame(contacts_wrap, bg=BG_PANEL)
+        self._contacts_frame = tk.Frame(self._contacts_wrap, bg=BG_PANEL) 
         self._contacts_frame.pack(fill='both', expand=True)
         self.contact_btns = {}
+        self._history_panel = CallHistoryFrame(side)
+        self._history_panel.grid(row=3, column=0, sticky='nsew')
+        self._history_panel.grid_remove()
 
     def _make_contact_row(self, parent, c: dict) -> None:
         name      = c['name']
