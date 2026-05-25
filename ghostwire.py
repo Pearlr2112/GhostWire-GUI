@@ -1,8 +1,13 @@
 """
 GhostWire – multi-user secure Morse-code messaging app
 Powered by Supabase for real-time messaging and invite-code contacts.
+Video/audio calls powered by Jitsi Meet via pywebview — FREE, no account, no API key.
 
-NOTE: Do not commit SUPABASE_KEY to public repositories.
+Setup:
+    pip install pillow pywebview
+
+macOS: When asked for camera/microphone permission, click Allow.
+       pywebview uses the real WebKit engine so permissions work natively.
 """
 
 import base64
@@ -13,14 +18,8 @@ import string
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import messagebox
-
-try:
-    import cv2
-    from PIL import Image, ImageTk
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
 
 # ── Supabase (REST only, no extra SDK needed) ─────────────────────────────────
 import urllib.request
@@ -56,6 +55,61 @@ def sb_request(method: str, path: str, data: dict = None, params: dict = None) -
     except Exception as e:
         print(f"[Supabase] {method} {path} → {e}")
         return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Jitsi helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+JITSI_SERVER = "https://meet.jit.si"  # free, no account needed
+
+
+def make_jitsi_room_name() -> str:
+    """Generate a hard-to-guess room name."""
+    chars = string.ascii_lowercase + string.digits
+    return "ghostwire-" + "".join(random.choices(chars, k=16))
+
+
+def jitsi_room_url(room_name: str, start_audio_only: bool = False) -> str:
+    """
+    Build a Jitsi Meet URL with config fragment parameters.
+    startWithVideoMuted=true  → audio-only call
+    """
+    base = f"{JITSI_SERVER}/{room_name}"
+    if start_audio_only:
+        base += "#config.startWithVideoMuted=true&config.startWithAudioMuted=false"
+    return base
+
+
+def open_jitsi_window(url: str, title: str = "GhostWire Call") -> None:
+    """
+    Open Jitsi in an embedded pywebview window.
+    Camera and microphone work natively through WebKit on macOS.
+    Falls back to the system browser if pywebview isn't installed.
+    """
+    try:
+        import webview  # pywebview
+
+        def _run():
+            window = webview.create_window(
+                title, url,
+                width=1024, height=720,
+                min_size=(640, 480),
+                resizable=True,
+            )
+            # On macOS, pywebview uses WKWebView which handles media permissions.
+            webview.start(gui='cocoa')  # 'cocoa' on Mac; auto-detects on other OS
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    except ImportError:
+        # Graceful fallback — open in browser with a note
+        webbrowser.open(url)
+        messagebox.showinfo(
+            "pywebview not installed",
+            "The call opened in your browser instead.\n\n"
+            "For an embedded call window with native camera/mic support, run:\n"
+            "  pip install pywebview")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -211,14 +265,17 @@ def send_message(sender_id: str, receiver_id: str, morse: str, original: str) ->
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Call helpers
+#  Call helpers (Jitsi-backed, stored in Supabase for signalling)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def db_create_call(caller_id: str, receiver_id: str) -> str | None:
+def db_create_call(caller_id: str, receiver_id: str,
+                   room_url: str, room_name: str) -> str | None:
     result = sb_request("POST", "calls", {
-        "caller_id": caller_id,
-        "receiver_id": receiver_id,
-        "status": "ringing",
+        "caller_id":       caller_id,
+        "receiver_id":     receiver_id,
+        "status":          "ringing",
+        "daily_room_url":  room_url,    # column reused for Jitsi URL
+        "daily_room_name": room_name,   # column reused for Jitsi room name
     })
     if result:
         row = result[0] if isinstance(result, list) else result
@@ -230,7 +287,7 @@ def db_get_incoming_call(user_id: str) -> dict | None:
     rows = sb_request("GET", "calls", params={
         "receiver_id": f"eq.{user_id}",
         "status":      "eq.ringing",
-        "select":      "id,caller_id,created_at",
+        "select":      "id,caller_id,daily_room_url,daily_room_name,created_at",
         "order":       "created_at.desc",
         "limit":       "1",
     })
@@ -241,32 +298,12 @@ def db_update_call_status(call_id: str, status: str) -> None:
     sb_request("PATCH", f"calls?id=eq.{call_id}", {"status": status})
 
 
-def db_push_frame(call_id: str, sender_id: str, frame_b64: str) -> None:
-    sb_request("POST", "call_frames", {
-        "call_id":    call_id,
-        "sender_id":  sender_id,
-        "frame_data": frame_b64,
+def db_get_call(call_id: str) -> dict | None:
+    rows = sb_request("GET", "calls", params={
+        "id":     f"eq.{call_id}",
+        "select": "status,daily_room_url,daily_room_name",
     })
-    rows = sb_request("GET", "call_frames", params={
-        "call_id":   f"eq.{call_id}",
-        "sender_id": f"eq.{sender_id}",
-        "select":    "id,created_at",
-        "order":     "created_at.desc",
-    }) or []
-    if len(rows) > 5:
-        for old in rows[5:]:
-            sb_request("DELETE", f"call_frames?id=eq.{old['id']}")
-
-
-def db_get_latest_remote_frame(call_id: str, remote_id: str) -> str | None:
-    rows = sb_request("GET", "call_frames", params={
-        "call_id":   f"eq.{call_id}",
-        "sender_id": f"eq.{remote_id}",
-        "select":    "frame_data,created_at",
-        "order":     "created_at.desc",
-        "limit":     "1",
-    })
-    return rows[0]["frame_data"] if rows else None
+    return rows[0] if rows else None
 
 
 def db_is_call_active(call_id: str) -> bool:
@@ -596,25 +633,27 @@ class InviteDialog(tk.Toplevel):
 
 class IncomingCallDialog(tk.Toplevel):
 
-    def __init__(self, master, call_id: str, caller_name: str, on_accept, on_decline):
+    def __init__(self, master, call_id: str, caller_name: str,
+                 room_url: str, on_accept, on_decline):
         super().__init__(master)
         self.title('Incoming Call')
         self.configure(bg=BG_PANEL)
         self.resizable(False, False)
         self.grab_set()
         self.attributes('-topmost', True)
-        self._call_id    = call_id
-        self._on_accept  = on_accept
+        self._call_id   = call_id
+        self._room_url  = room_url
+        self._on_accept = on_accept
         self._on_decline = on_decline
         self._build(caller_name)
-        self.geometry('340x220')
+        self.geometry('340x240')
         self._centre()
 
     def _centre(self):
         self.update_idletasks()
         x = self.master.winfo_x() + (self.master.winfo_width()  - 340) // 2
-        y = self.master.winfo_y() + (self.master.winfo_height() - 220) // 2
-        self.geometry(f'340x220+{x}+{y}')
+        y = self.master.winfo_y() + (self.master.winfo_height() - 240) // 2
+        self.geometry(f'340x240+{x}+{y}')
 
     def _build(self, caller_name: str):
         pad = tk.Frame(self, bg=BG_PANEL, padx=30, pady=24)
@@ -626,10 +665,16 @@ class IncomingCallDialog(tk.Toplevel):
         ring.create_text(30, 30, text='📞', font=('Helvetica', 20))
         self._animate_ring(ring)
 
-        tk.Label(pad, text=f'{caller_name}', font=('Helvetica', 15, 'bold'),
+        tk.Label(pad, text=caller_name, font=('Helvetica', 15, 'bold'),
                  bg=BG_PANEL, fg=TEXT_PRI).pack(pady=(10, 2))
         tk.Label(pad, text='Incoming GhostWire call…',
                  font=('Helvetica', 9), bg=BG_PANEL, fg=TEXT_SEC).pack()
+
+        # Show whether it's a video or audio-only call
+        is_audio_only = 'startWithVideoMuted=true' in self._room_url
+        call_type_txt = '🎙  Audio-only call' if is_audio_only else '📹  Video + audio call'
+        tk.Label(pad, text=call_type_txt,
+                 font=('Helvetica', 9, 'bold'), bg=BG_PANEL, fg=TEAL).pack(pady=(4, 0))
 
         btns = tk.Frame(pad, bg=BG_PANEL)
         btns.pack(pady=(18, 0))
@@ -656,7 +701,7 @@ class IncomingCallDialog(tk.Toplevel):
             self.after_cancel(self._anim_job)
         db_update_call_status(self._call_id, 'active')
         self.destroy()
-        self._on_accept(self._call_id)
+        self._on_accept(self._call_id, self._room_url)
 
     def _decline(self):
         if hasattr(self, '_anim_job'):
@@ -667,220 +712,119 @@ class IncomingCallDialog(tk.Toplevel):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Call window
+#  Active call status window
 # ──────────────────────────────────────────────────────────────────────────────
 
-class CallWindow(tk.Toplevel):
+class CallStatusWindow(tk.Toplevel):
+    """
+    Small always-on-top overlay shown while a Jitsi call is running.
+    The actual video/audio plays inside a pywebview window (real WebKit).
+    This overlay shows elapsed time, call type, and an End Call button.
+    """
 
-    FRAME_INTERVAL_MS = 200
-    POLL_INTERVAL_MS  = 250
+    POLL_MS = 4000
 
-    def __init__(self, master, call_id: str, my_id: str, remote_id: str,
-                 remote_name: str, on_end):
+    def __init__(self, master, call_id: str, remote_name: str,
+                 room_name: str, call_type: str, on_end):
         super().__init__(master)
         self.title(f'Call with {remote_name}')
-        self.configure(bg='#000000')
-        self.geometry('720x500')
-        self.minsize(480, 360)
+        self.configure(bg=BG_DARK)
+        self.geometry('320x200')
+        self.resizable(False, False)
         self.attributes('-topmost', True)
 
-        self._call_id      = call_id
-        self._my_id        = my_id
-        self._remote_id    = remote_id
-        self._remote_name  = remote_name
-        self._on_end       = on_end
-        self._running      = True
-        self._cap          = None
-        self._local_photo  = None
-        self._remote_photo = None
+        self._call_id    = call_id
+        self._remote     = remote_name
+        self._room_name  = room_name
+        self._call_type  = call_type   # 'video' or 'audio'
+        self._on_end     = on_end
+        self._running    = True
+        self._elapsed    = 0
 
         self._build_ui()
-
-        if CV2_AVAILABLE:
-            self._open_camera()
-            self._schedule_send()
-        else:
-            self._show_no_cv2()
-
-        self._schedule_recv()
-        self._schedule_status_check()
+        self._schedule_poll()
+        self._tick()
         self.protocol('WM_DELETE_WINDOW', self._hang_up)
 
     def _build_ui(self):
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
+        pad = tk.Frame(self, bg=BG_DARK, padx=20, pady=16)
+        pad.pack(fill='both', expand=True)
 
-        self.remote_canvas = tk.Canvas(self, bg='#111111',
-                                       highlightthickness=0, cursor='none')
-        self.remote_canvas.grid(row=0, column=0, sticky='nsew')
+        # Status row
+        dot_row = tk.Frame(pad, bg=BG_DARK)
+        dot_row.pack()
+        self._dot_canvas = tk.Canvas(dot_row, width=12, height=12,
+                                     bg=BG_DARK, highlightthickness=0)
+        self._dot_canvas.pack(side='left', padx=(0, 6))
+        self._dot = self._dot_canvas.create_oval(1, 1, 11, 11, fill=TEAL, outline='')
 
-        self._remote_placeholder = self.remote_canvas.create_text(
-            360, 220, text=f'Connecting to {self._remote_name}…',
-            fill=TEXT_SEC, font=('Helvetica', 13))
+        call_label = ('📹  Jitsi video call' if self._call_type == 'video'
+                      else '🎙  Jitsi audio-only call')
+        tk.Label(dot_row, text=call_label,
+                 font=('Helvetica', 9), bg=BG_DARK, fg=TEAL).pack(side='left')
 
-        self.pip_canvas = tk.Canvas(self, width=160, height=120,
-                                    bg='#222222', highlightthickness=2,
-                                    highlightbackground=ACCENT)
-        self.pip_canvas.place(relx=1.0, rely=1.0, anchor='se', x=-60, y=-60)
+        tk.Label(pad, text=self._remote,
+                 font=('Helvetica', 16, 'bold'), bg=BG_DARK, fg=TEXT_PRI).pack(pady=(10, 2))
 
-        self._pip_placeholder = self.pip_canvas.create_text(
-            80, 60, text='Camera…', fill=TEXT_MORSE, font=('Helvetica', 9))
+        self._timer_var = tk.StringVar(value='00:00')
+        tk.Label(pad, textvariable=self._timer_var,
+                 font=('Courier', 12), bg=BG_DARK, fg=TEXT_SEC).pack()
 
-        bar = tk.Frame(self, bg=BG_DARK, pady=10)
-        bar.grid(row=1, column=0, sticky='ew')
+        tk.Label(pad, text='Camera & mic running in embedded WebKit window',
+                 font=('Helvetica', 8), bg=BG_DARK, fg=TEXT_MORSE).pack(pady=(4, 0))
 
-        self._status_var = tk.StringVar(value='🟢  Connected')
-        tk.Label(bar, textvariable=self._status_var,
-                 font=('Helvetica', 10), bg=BG_DARK, fg=TEAL).pack(side='left', padx=16)
+        btn_row = tk.Frame(pad, bg=BG_DARK)
+        btn_row.pack(pady=(14, 0))
 
-        tk.Label(bar, text=f'📞  {self._remote_name}',
-                 font=('Helvetica', 10, 'bold'), bg=BG_DARK, fg=TEXT_PRI).pack(side='left')
+        tk.Button(btn_row, text='⬛  End Call',
+                  font=('Helvetica', 10, 'bold'),
+                  bg=RED_ERR, fg='white', activebackground='#c0455a',
+                  relief='flat', cursor='hand2', padx=18, pady=7,
+                  command=self._hang_up).pack()
 
-        hangup = tk.Button(bar, text='⬛  End Call',
-                           font=('Helvetica', 10, 'bold'),
-                           bg=RED_ERR, fg='white', activebackground='#c0455a',
-                           relief='flat', cursor='hand2', padx=18, pady=6,
-                           command=self._hang_up)
-        hangup.pack(side='right', padx=16)
-
-        self._mute_var = tk.BooleanVar(value=False)
-        mute_btn = tk.Button(bar, text='🎤  Mute',
-                             font=('Helvetica', 9),
-                             bg=BG_CARD, fg=TEXT_SEC, activebackground=ACCENT,
-                             relief='flat', cursor='hand2', padx=12, pady=6,
-                             command=lambda: self._toggle_mute(mute_btn))
-        mute_btn.pack(side='right', padx=(0, 6))
-
-    def _toggle_mute(self, btn):
-        self._mute_var.set(not self._mute_var.get())
-        if self._mute_var.get():
-            btn.config(text='🔇  Unmute', bg=RED_ERR, fg='white')
-        else:
-            btn.config(text='🎤  Mute', bg=BG_CARD, fg=TEXT_SEC)
-
-    def _show_no_cv2(self):
-        self.remote_canvas.itemconfig(
-            self._remote_placeholder,
-            text='opencv-python not installed.\nRun: pip install opencv-python pillow',
-            font=('Helvetica', 12))
-
-    def _open_camera(self):
-        def _init():
-            cap = cv2.VideoCapture(0)
-            if cap.isOpened():
-                self._cap = cap
-            else:
-                self.after(0, lambda: self.remote_canvas.itemconfig(
-                    self._remote_placeholder,
-                    text='Could not open webcam.\nCheck camera permissions.'))
-        threading.Thread(target=_init, daemon=True).start()
-
-    def _schedule_send(self):
+    def _tick(self):
         if not self._running:
             return
-        threading.Thread(target=self._capture_and_send, daemon=True).start()
-        self._send_job = self.after(self.FRAME_INTERVAL_MS, self._schedule_send)
+        self._elapsed += 1
+        m, s = divmod(self._elapsed, 60)
+        self._timer_var.set(f'{m:02d}:{s:02d}')
+        colour = TEAL if self._elapsed % 2 == 0 else TEAL_DARK
+        self._dot_canvas.itemconfig(self._dot, fill=colour)
+        self._tick_job = self.after(1000, self._tick)
 
-    def _capture_and_send(self):
-        if not self._cap or not self._cap.isOpened():
-            return
-        ret, frame = self._cap.read()
-        if not ret:
-            return
-        frame = cv2.flip(frame, 1)
-        pip_frame = cv2.resize(frame, (160, 120))
-        self._show_frame_on_canvas(pip_frame, self.pip_canvas,
-                                   self._pip_placeholder, 160, 120)
-        frame_small = cv2.resize(frame, (320, 240))
-        _, buf = cv2.imencode('.jpg', frame_small, [cv2.IMWRITE_JPEG_QUALITY, 60])
-        b64 = base64.b64encode(buf.tobytes()).decode()
-        try:
-            db_push_frame(self._call_id, self._my_id, b64)
-        except Exception as e:
-            print(f'[Call] frame send error: {e}')
-
-    def _schedule_recv(self):
+    def _schedule_poll(self):
         if not self._running:
             return
-        threading.Thread(target=self._fetch_remote_frame, daemon=True).start()
-        self._recv_job = self.after(self.POLL_INTERVAL_MS, self._schedule_recv)
+        threading.Thread(target=self._check_status, daemon=True).start()
+        self._poll_job = self.after(self.POLL_MS, self._schedule_poll)
 
-    def _fetch_remote_frame(self):
-        try:
-            b64 = db_get_latest_remote_frame(self._call_id, self._remote_id)
-        except Exception:
-            return
-        if not b64:
-            return
-        try:
-            import numpy as np
-            raw   = base64.b64decode(b64)
-            img   = Image.frombytes('RGB', (320, 240),
-                                    cv2.cvtColor(
-                                        cv2.imdecode(
-                                            np.frombuffer(raw, np.uint8),
-                                            cv2.IMREAD_COLOR),
-                                        cv2.COLOR_BGR2RGB).tobytes())
-            w = self.remote_canvas.winfo_width()  or 720
-            h = self.remote_canvas.winfo_height() or 440
-            img = img.resize((w, h), Image.LANCZOS)
-            photo = ImageTk.PhotoImage(img)
-            self.after(0, lambda p=photo: self._paint_remote(p))
-        except Exception as e:
-            print(f'[Call] frame decode error: {e}')
-
-    def _paint_remote(self, photo):
-        self._remote_photo = photo
-        self.remote_canvas.delete('all')
-        self.remote_canvas.create_image(0, 0, anchor='nw', image=photo)
-
-    def _show_frame_on_canvas(self, bgr_frame, canvas, placeholder_id, w, h):
-        try:
-            rgb   = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-            img   = Image.fromarray(rgb)
-            photo = ImageTk.PhotoImage(img)
-
-            def _draw(p=photo, c=canvas, ph=placeholder_id):
-                self._local_photo = p
-                c.delete(ph)
-                c.create_image(0, 0, anchor='nw', image=p)
-
-            self.after(0, _draw)
-        except Exception as e:
-            print(f'[Call] local render error: {e}')
-
-    def _schedule_status_check(self):
-        if not self._running:
-            return
-        def _check():
-            if not db_is_call_active(self._call_id):
-                self.after(0, self._remote_hung_up)
-        threading.Thread(target=_check, daemon=True).start()
-        self._status_job = self.after(3000, self._schedule_status_check)
+    def _check_status(self):
+        if not db_is_call_active(self._call_id):
+            self.after(0, self._remote_hung_up)
 
     def _remote_hung_up(self):
-        self._status_var.set('🔴  Call ended by remote')
-        self.after(2000, self._close)
+        if not self._running:
+            return
+        self._running = False
+        self._cancel_jobs()
+        tk.Label(self, text='Call ended by remote', font=('Helvetica', 10),
+                 bg=BG_DARK, fg=RED_ERR).place(relx=0.5, rely=0.5, anchor='center')
+        self.after(2500, self._close)
 
     def _hang_up(self):
         self._running = False
-        for attr in ('_send_job', '_recv_job', '_status_job'):
-            job = getattr(self, attr, None)
-            if job:
-                self.after_cancel(job)
-        if self._cap:
-            self._cap.release()
-        try:
-            db_update_call_status(self._call_id, 'ended')
-        except Exception:
-            pass
+        self._cancel_jobs()
+        db_update_call_status(self._call_id, 'ended')
         self._close()
 
+    def _cancel_jobs(self):
+        for attr in ('_tick_job', '_poll_job'):
+            job = getattr(self, attr, None)
+            if job:
+                try: self.after_cancel(job)
+                except Exception: pass
+
     def _close(self):
-        self._running = False
-        if self._cap:
-            try: self._cap.release()
-            except Exception: pass
         self._on_end()
         try: self.destroy()
         except Exception: pass
@@ -1095,9 +1039,11 @@ class MorseChatApp(tk.Tk):
         pane.grid_rowconfigure(1, weight=1)
         pane.grid_columnconfigure(0, weight=1)
 
+        # ── Chat header ───────────────────────────────────────────────────────
         self.chat_header = tk.Frame(pane, bg=BG_PANEL, pady=12, padx=18)
         self.chat_header.grid(row=0, column=0, columnspan=2, sticky='ew')
 
+        # Contact avatar + name (left side)
         self.hdr_canvas = tk.Canvas(self.chat_header, width=40, height=40,
                                     bg=BG_PANEL, highlightthickness=0)
         self.hdr_canvas.pack(side='left', padx=(0, 12))
@@ -1111,16 +1057,46 @@ class MorseChatApp(tk.Tk):
                                  font=('Helvetica', 9), bg=BG_PANEL, fg=TEXT_MORSE)
         self.hdr_sub.pack(anchor='w')
 
-        # ── Call button ───────────────────────────────────────────────────────
-        self._call_btn = tk.Button(
-            self.chat_header, text='📞',
-            font=('Helvetica', 14), bg=BG_PANEL, fg=TEAL,
-            activebackground=BG_HOVER, relief='flat', cursor='hand2',
-            padx=8, pady=4, command=self._start_call)
-        self._call_btn.pack(side='right', padx=(0, 4))
+        # ── Call buttons (right side) ─────────────────────────────────────────
+        # Jitsi badge
+        tk.Label(self.chat_header, text='Jitsi · free · no account',
+                 font=('Helvetica', 7), bg=BG_PANEL, fg=TEXT_MORSE).pack(side='right', padx=(0, 6))
+
+        # 📞 Audio-only button
+        self._audio_btn = tk.Button(
+            self.chat_header,
+            text='📞',
+            font=('Helvetica', 15),
+            bg=BG_PANEL, fg=TEAL,
+            activebackground=BG_HOVER,
+            relief='flat', cursor='hand2',
+            padx=6, pady=2,
+            command=lambda: self._start_call(audio_only=True),
+        )
+        self._audio_btn.pack(side='right', padx=(0, 2))
+        self._audio_btn.bind('<Enter>', lambda e: self._audio_btn.config(bg=BG_HOVER))
+        self._audio_btn.bind('<Leave>', lambda e: self._audio_btn.config(bg=BG_PANEL))
+        self._make_tooltip(self._audio_btn, 'Audio-only call  (camera muted)')
+
+        # 📹 Video call button
+        self._video_btn = tk.Button(
+            self.chat_header,
+            text='📹',
+            font=('Helvetica', 15),
+            bg=BG_PANEL, fg=ACCENT,
+            activebackground=BG_HOVER,
+            relief='flat', cursor='hand2',
+            padx=6, pady=2,
+            command=lambda: self._start_call(audio_only=False),
+        )
+        self._video_btn.pack(side='right', padx=(0, 4))
+        self._video_btn.bind('<Enter>', lambda e: self._video_btn.config(bg=BG_HOVER))
+        self._video_btn.bind('<Leave>', lambda e: self._video_btn.config(bg=BG_PANEL))
+        self._make_tooltip(self._video_btn, 'Video call  (camera + mic)')
 
         divider(pane).grid(row=0, column=0, columnspan=2, sticky='sew')
 
+        # ── Message canvas ────────────────────────────────────────────────────
         self.msg_canvas = tk.Canvas(pane, bg=BG_DARK, highlightthickness=0, bd=0)
         self.msg_canvas.grid(row=1, column=0, sticky='nsew')
 
@@ -1139,6 +1115,7 @@ class MorseChatApp(tk.Tk):
         self.msg_canvas.bind_all('<Button-4>',   lambda e: self.msg_canvas.yview_scroll(-1, 'units'))
         self.msg_canvas.bind_all('<Button-5>',   lambda e: self.msg_canvas.yview_scroll(1, 'units'))
 
+        # ── Input bar ─────────────────────────────────────────────────────────
         inp = tk.Frame(pane, bg=BG_PANEL, pady=12, padx=16)
         inp.grid(row=2, column=0, columnspan=2, sticky='ew')
         inp.grid_columnconfigure(0, weight=1)
@@ -1164,6 +1141,31 @@ class MorseChatApp(tk.Tk):
         entry.bind('<Return>', lambda e: self._send())
 
         make_btn(inp, 'Send  ▶', self._send, font_size=10, pady=9, padx=18).grid(row=1, column=1)
+
+    # ── Tooltip helper ────────────────────────────────────────────────────────
+
+    def _make_tooltip(self, widget, text: str) -> None:
+        tip = None
+
+        def show(e):
+            nonlocal tip
+            tip = tk.Toplevel(widget)
+            tip.wm_overrideredirect(True)
+            tip.attributes('-topmost', True)
+            x = widget.winfo_rootx() + widget.winfo_width() // 2
+            y = widget.winfo_rooty() - 28
+            tip.wm_geometry(f'+{x}+{y}')
+            tk.Label(tip, text=text, font=('Helvetica', 9),
+                     bg='#2e3152', fg=TEXT_PRI, padx=8, pady=4).pack()
+
+        def hide(e):
+            nonlocal tip
+            if tip:
+                tip.destroy()
+                tip = None
+
+        widget.bind('<Enter>', show, add='+')
+        widget.bind('<Leave>', hide, add='+')
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
@@ -1281,44 +1283,75 @@ class MorseChatApp(tk.Tk):
             tk.Label(meta_row, text=ts, font=('Helvetica', 8),
                      bg=BG_DARK, fg=TEXT_MORSE).pack(side='left', padx=(8, 0))
 
-    # ── Call integration ──────────────────────────────────────────────────────
+    # ── Call integration (Jitsi via pywebview) ────────────────────────────────
 
-    def _start_call(self):
+    def _set_call_buttons_state(self, state: str) -> None:
+        """Enable or disable both call buttons."""
+        for btn in (self._video_btn, self._audio_btn):
+            btn.config(state=state)
+
+    def _start_call(self, audio_only: bool = False) -> None:
+        """Initiate a Jitsi call — video or audio-only."""
         if not self.active_contact:
             return
         if self._active_call:
             messagebox.showinfo('Call in progress', 'You already have an active call.')
             return
-        if not CV2_AVAILABLE:
-            messagebox.showerror(
-                'Missing dependency',
-                'Install opencv-python and pillow:\n\npip install opencv-python pillow')
-            return
 
         their_id   = self.active_contact['id']
         their_name = self.active_contact['name']
 
+        # Show busy state on both buttons
+        self._set_call_buttons_state('disabled')
+        self._video_btn.config(text='⏳')
+        self._audio_btn.config(text='⏳')
+
+        call_type = 'audio' if audio_only else 'video'
+
+        def _restore_buttons():
+            self._video_btn.config(text='📹', state='normal')
+            self._audio_btn.config(text='📞', state='normal')
+
         def _do():
-            call_id = db_create_call(self._user_id, their_id)
+            # 1. Generate a Jitsi room
+            room_name = make_jitsi_room_name()
+            room_url  = jitsi_room_url(room_name, start_audio_only=audio_only)
+
+            # 2. Store call in Supabase for signalling
+            call_id = db_create_call(self._user_id, their_id, room_url, room_name)
             if not call_id:
-                self.after(0, lambda: messagebox.showerror('Error', 'Could not start call.'))
+                self.after(0, lambda: (
+                    _restore_buttons(),
+                    messagebox.showerror('Error', 'Could not register call in database.')))
                 return
-            for _ in range(30):
+
+            # 3. Open Jitsi for the caller immediately in embedded window
+            call_title = f'GhostWire — {"Audio" if audio_only else "Video"} call with {their_name}'
+            self.after(0, lambda: open_jitsi_window(room_url, call_title))
+
+            # 4. Poll for receiver acceptance (up to 60 s)
+            for _ in range(60):
                 time.sleep(1)
                 rows = sb_request("GET", "calls", params={
                     "id": f"eq.{call_id}", "select": "status"})
                 if rows:
                     status = rows[0].get('status')
                     if status == 'active':
-                        self.after(0, lambda cid=call_id: self._open_call_window(
-                            cid, their_id, their_name))
+                        self.after(0, lambda cid=call_id, rn=room_name: (
+                            _restore_buttons(),
+                            self._open_call_status(cid, their_name, rn, call_type)))
                         return
                     if status in ('declined', 'ended'):
-                        self.after(0, lambda: messagebox.showinfo(
-                            'Call', f'{their_name} declined the call.'))
+                        self.after(0, lambda: (
+                            _restore_buttons(),
+                            messagebox.showinfo('Call', f'{their_name} declined the call.')))
                         return
+
+            # Timed out
             db_update_call_status(call_id, 'ended')
-            self.after(0, lambda: messagebox.showinfo('Call', f'{their_name} did not answer.'))
+            self.after(0, lambda: (
+                _restore_buttons(),
+                messagebox.showinfo('Call', f'{their_name} did not answer.')))
 
         # FIX: removed stray `supabase.table("calls")` line that caused NameError
         threading.Thread(target=_do, daemon=True).start()
@@ -1331,30 +1364,48 @@ class MorseChatApp(tk.Tk):
             call = db_get_incoming_call(self._user_id)
             if not call:
                 return
-            call_id = call['id']
+            call_id  = call['id']
             if call_id == self._seen_incoming_call_id:
                 return
             self._seen_incoming_call_id = call_id
             caller_name = db_get_caller_name(call['caller_id'])
+            room_url    = call.get('daily_room_url', '')   # column reused for Jitsi URL
 
             def _show():
                 IncomingCallDialog(
-                    self, call_id, caller_name,
-                    on_accept=lambda cid=call_id: self._open_call_window(
-                        cid, call['caller_id'], caller_name),
+                    self, call_id, caller_name, room_url,
+                    on_accept=self._on_call_accepted,
                     on_decline=lambda: None,
                 )
             self.after(0, _show)
 
         threading.Thread(target=_do, daemon=True).start()
 
-    def _open_call_window(self, call_id: str, remote_id: str, remote_name: str):
+    def _on_call_accepted(self, call_id: str, room_url: str):
+        """Called when the receiver taps Accept — open Jitsi for them too."""
+        call = db_get_call(call_id)
+        room_name  = call.get('daily_room_name', '') if call else ''
+        audio_only = 'startWithVideoMuted=true' in room_url
+        call_type  = 'audio' if audio_only else 'video'
+
+        rows = sb_request("GET", "calls", params={"id": f"eq.{call_id}", "select": "caller_id"})
+        remote_name = db_get_caller_name(rows[0]['caller_id']) if rows else 'Caller'
+        call_title  = f'GhostWire — {"Audio" if audio_only else "Video"} call with {remote_name}'
+
+        # Open Jitsi embedded window for the receiver
+        open_jitsi_window(room_url, call_title)
+        self._open_call_status(call_id, remote_name, room_name, call_type)
+
+    def _open_call_status(self, call_id: str, remote_name: str,
+                          room_name: str, call_type: str):
         self._active_call = call_id
 
         def _on_end():
             self._active_call = None
+            self._video_btn.config(text='📹', state='normal')
+            self._audio_btn.config(text='📞', state='normal')
 
-        CallWindow(self, call_id, self._user_id, remote_id, remote_name, _on_end)
+        CallStatusWindow(self, call_id, remote_name, room_name, call_type, _on_end)
 
     # ── Canvas helpers ────────────────────────────────────────────────────────
 
