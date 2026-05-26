@@ -119,6 +119,14 @@ class CallHistoryFrame(tk.Frame):
         hdr.pack(fill='x', padx=14, pady=(10, 6))
         tk.Label(hdr, text='CALL HISTORY', font=('Helvetica', 8, 'bold'),
                  bg=BG_PANEL, fg=TEXT_MORSE).pack(side='left', padx=2)
+        self._close_cb = None
+        self._close_btn = tk.Button(
+            hdr, text='✕ Close', font=('Helvetica', 9),
+            bg=BG_PANEL, fg=TEXT_SEC, activebackground=BG_HOVER,
+            relief='flat', cursor='hand2', padx=4, pady=0,
+            command=self._do_close,
+        )
+        self._close_btn.pack(side='right')
         tk.Button(
             hdr, text='↻', font=('Helvetica', 11),
             bg=BG_PANEL, fg=TEXT_SEC, activebackground=BG_HOVER,
@@ -150,6 +158,13 @@ class CallHistoryFrame(tk.Frame):
         self._canvas.bind('<Button-5>',   lambda e: self._canvas.yview_scroll(1, 'units'))
 
         self.refresh()
+
+    def set_close_callback(self, cb):
+        self._close_cb = cb
+
+    def _do_close(self):
+        if self._close_cb:
+            self._close_cb()
 
     def _on_scroll(self, event):
         self._canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
