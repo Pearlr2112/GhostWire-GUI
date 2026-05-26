@@ -710,7 +710,6 @@ class IncomingCallDialog(tk.Toplevel):
             self.after_cancel(self._anim_job)
         db_update_call_status(self._call_id, 'declined')
         try:
-            from call_history_tab import history_add
             from datetime import datetime
             history_add(getattr(self, '_caller_name', 'Unknown'), "incoming", "video", "declined", datetime.now(), None)
         except Exception:
@@ -824,7 +823,6 @@ class CallStatusWindow(tk.Toplevel):
         self._cancel_jobs()
         db_update_call_status(self._call_id, 'ended')
         try:
-            from call_history_tab import history_add
             from datetime import datetime
             history_add(self._remote, "outgoing", "video", "answered", datetime.now(), None)
         except Exception:
@@ -981,6 +979,15 @@ class MorseChatApp(tk.Tk):
         contacts_wrap = tk.Frame(side, bg=BG_PANEL)
         contacts_wrap.grid(row=2, column=0, sticky='nsew', pady=6)
 
+        # Always-visible header with History toggle
+        top_hdr = tk.Frame(contacts_wrap, bg=BG_PANEL)
+        top_hdr.pack(fill='x', padx=10, pady=(8, 0))
+        self._hist_btn = make_btn(top_hdr, "📞 History", self._toggle_history, font_size=8, bold=True, padx=8, pady=4)
+        self._hist_btn.pack(side='right')
+        self._close_hist_btn = make_btn(top_hdr, '✕', self._toggle_history, font_size=10, bold=True, padx=6, pady=4)
+        self._close_hist_btn.pack_forget()
+
+
         conv_hdr = tk.Frame(contacts_wrap, bg=BG_PANEL)
         conv_hdr.pack(fill='x', padx=10, pady=(8, 4))
         tk.Label(conv_hdr, text='CONVERSATIONS',
@@ -990,27 +997,28 @@ class MorseChatApp(tk.Tk):
                            font_size=8, bold=True, padx=8, pady=4,
                            bg=ACCENT, hover=ACCENT_HOVER)
         add_btn.pack(side='right')
-        hist_btn = make_btn(conv_hdr, "📞 History", self._toggle_history, font_size=8, bold=True, padx=8, pady=4)
-        hist_btn.pack(side='right')
 
         self._contacts_frame = tk.Frame(contacts_wrap, bg=BG_PANEL) 
         self._contacts_frame.pack(fill='both', expand=True)
         self.contact_btns = {}
         self._history_panel = CallHistoryFrame(side)
+        self._history_panel.set_close_callback(self._toggle_history)
+        self._history_panel.set_close_callback(self._toggle_history)
 
 
 
     def _toggle_history(self):
-        from call_history_tab import history_add
-        from datetime import datetime
-        from call_history_tab import history_add
         if self._history_panel.winfo_viewable():
             self._history_panel.pack_forget()
             self._contacts_frame.pack(fill='both', expand=True)
+            self._hist_btn.config(text="📞 History")
+            self._close_hist_btn.pack_forget()
         else:
             self._contacts_frame.pack_forget()
             self._history_panel.pack(fill='both', expand=True)
             self._history_panel.refresh()
+            self._hist_btn.config(text="📞 History")
+            self._close_hist_btn.pack(side='left')
 
     def _make_contact_row(self, parent, c: dict) -> None:
         name      = c['name']
@@ -1359,6 +1367,11 @@ class MorseChatApp(tk.Tk):
             # 3. Open Jitsi for the caller immediately in embedded window
             call_title = f'GhostWire — {"Audio" if audio_only else "Video"} call with {their_name}'
             self.after(0, lambda: open_jitsi_window(room_url, call_title))
+            from datetime import datetime
+            from call_history_tab import history_add
+            from datetime import datetime
+            history_add(their_name, "outgoing", call_type, "answered", datetime.now(), None)
+            from datetime import datetime
             from call_history_tab import history_add
             from datetime import datetime
             history_add(their_name, "outgoing", call_type, "answered", datetime.now(), None)
