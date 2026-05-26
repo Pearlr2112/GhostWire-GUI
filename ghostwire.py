@@ -1359,6 +1359,9 @@ class MorseChatApp(tk.Tk):
             # 3. Open Jitsi for the caller immediately in embedded window
             call_title = f'GhostWire — {"Audio" if audio_only else "Video"} call with {their_name}'
             self.after(0, lambda: open_jitsi_window(room_url, call_title))
+            from call_history_tab import history_add
+            from datetime import datetime
+            history_add(their_name, "outgoing", call_type, "answered", datetime.now(), None)
 
             # 4. Poll for receiver acceptance (up to 60 s)
             for _ in range(60):
