@@ -6,4 +6,6 @@ __pycache__/
 *.swp
 
 # Ignore your secret local environment files
-.env
+.envbuild/
+dist/
+*.spec
