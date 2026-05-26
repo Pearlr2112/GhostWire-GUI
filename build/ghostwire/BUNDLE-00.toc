@@ -1,0 +1,3 @@
+([('GhostWire',
+   '/Users/raniy/Desktop/GhostWire-GUI/dist/GhostWire',
+   'EXECUTABLE')],)
