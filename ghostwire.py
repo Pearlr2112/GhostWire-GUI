@@ -1,3 +1,9 @@
+from call_history_tab import CallHistoryFrame
+import base64
+import hashlib
+import json
+import re
+import base64
 import os
 import random
 import string
@@ -5,7 +11,14 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
+import io
+import mimetypes
+try:
+    from PIL import Image, ImageTk
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 
 # ── Supabase (REST only, no extra SDK needed) ─────────────────────────────────
 import urllib.request
@@ -42,45 +55,6 @@ def sb_request(method: str, path: str, data: dict = None, params: dict = None) -
         print(f"[Supabase] {method} {path} → {e}")
         return None
 
-# ── Media upload (Supabase Storage) ──────────────────────────────────────────
-import mimetypes
-from tkinter import filedialog
-from PIL import Image, ImageTk
-import io
-
-MEDIA_PREFIX   = "__MEDIA__:"          # sentinel stored in the `original` field
-STORAGE_BUCKET = "ghostwire-media"
-
-def upload_media_to_supabase(local_path: str, user_id: str) -> str | None:
-    """Upload a file to Supabase Storage and return its public URL."""
-    ext = os.path.splitext(local_path)[1].lower()
-    mime, _ = mimetypes.guess_type(local_path)
-    mime = mime or "application/octet-stream"
-
-    # Unique remote filename
-    remote_name = f"{user_id}/{int(time.time())}_{os.path.basename(local_path)}"
-    upload_url = (
-        f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{remote_name}"
-    )
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": mime,
-    }
-
-    with open(local_path, "rb") as f:
-        data = f.read()
-
-    req = urllib.request.Request(upload_url, data=data, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30):
-            pass
-    except Exception as e:
-        print(f"[Storage] upload failed: {e}")
-        return None
-
-    # Build the public URL
-    return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{remote_name}"
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Jitsi helpers
@@ -297,6 +271,42 @@ def send_message(sender_id: str, receiver_id: str, morse: str, original: str) ->
         "original": original,
     })
     return result is not None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Media helpers (Supabase Storage)
+# ──────────────────────────────────────────────────────────────────────────────
+
+MEDIA_PREFIX   = "__MEDIA__:"          # sentinel stored in the `original` field
+STORAGE_BUCKET = "ghostwire-media"     # create this public bucket in Supabase
+
+
+def upload_media_to_supabase(local_path: str, user_id: str) -> str | None:
+    """Upload a file to Supabase Storage and return its public URL, or None on failure."""
+    mime, _ = mimetypes.guess_type(local_path)
+    mime = mime or "application/octet-stream"
+
+    remote_name = f"{user_id}/{int(time.time())}_{os.path.basename(local_path)}"
+    upload_url  = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{remote_name}"
+
+    storage_headers = {
+        "apikey":        SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type":  mime,
+    }
+
+    with open(local_path, "rb") as fh:
+        data = fh.read()
+
+    req = urllib.request.Request(upload_url, data=data, headers=storage_headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30):
+            pass
+    except Exception as exc:
+        print(f"[Storage] upload failed: {exc}")
+        return None
+
+    return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{remote_name}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -742,6 +752,11 @@ class IncomingCallDialog(tk.Toplevel):
         if hasattr(self, '_anim_job'):
             self.after_cancel(self._anim_job)
         db_update_call_status(self._call_id, 'declined')
+        try:
+            from datetime import datetime
+            history_add(getattr(self, '_caller_name', 'Unknown'), "incoming", "video", "declined", datetime.now(), None)
+        except Exception:
+            pass
         self.destroy()
         self._on_decline()
 
@@ -850,6 +865,11 @@ class CallStatusWindow(tk.Toplevel):
         self._running = False
         self._cancel_jobs()
         db_update_call_status(self._call_id, 'ended')
+        try:
+            from datetime import datetime
+            history_add(self._remote, "outgoing", "video", "answered", datetime.now(), None)
+        except Exception:
+            pass
         self._close()
 
     def _cancel_jobs(self):
@@ -963,7 +983,7 @@ class MorseChatApp(tk.Tk):
         self._build_chat_pane()
 
     def _build_sidebar(self) -> None:
-        side = tk.Frame(self, bg=BG_PANEL, width=240)
+        side = tk.Frame(self, bg=BG_PANEL, width=320)
         side.grid(row=0, column=0, sticky='nsew')
         side.grid_propagate(False)
         side.grid_rowconfigure(2, weight=1)
@@ -1002,7 +1022,16 @@ class MorseChatApp(tk.Tk):
         contacts_wrap = tk.Frame(side, bg=BG_PANEL)
         contacts_wrap.grid(row=2, column=0, sticky='nsew', pady=6)
 
-        conv_hdr = tk.Frame(self._contacts_wrap, bg=BG_PANEL)
+        # Always-visible header with History toggle
+        top_hdr = tk.Frame(contacts_wrap, bg=BG_PANEL)
+        top_hdr.pack(fill='x', padx=10, pady=(8, 0))
+        self._hist_btn = make_btn(top_hdr, "📞 History", self._toggle_history, font_size=8, bold=True, padx=8, pady=4)
+        self._hist_btn.pack(side='right')
+        self._close_hist_btn = make_btn(top_hdr, '✕', self._toggle_history, font_size=10, bold=True, padx=6, pady=4)
+        self._close_hist_btn.pack_forget()
+
+
+        conv_hdr = tk.Frame(contacts_wrap, bg=BG_PANEL)
         conv_hdr.pack(fill='x', padx=10, pady=(8, 4))
         tk.Label(conv_hdr, text='CONVERSATIONS',
                  font=('Helvetica', 8, 'bold'), bg=BG_PANEL,
@@ -1012,12 +1041,27 @@ class MorseChatApp(tk.Tk):
                            bg=ACCENT, hover=ACCENT_HOVER)
         add_btn.pack(side='right')
 
-        self._contacts_frame = tk.Frame(self._contacts_wrap, bg=BG_PANEL) 
+        self._contacts_frame = tk.Frame(contacts_wrap, bg=BG_PANEL) 
         self._contacts_frame.pack(fill='both', expand=True)
         self.contact_btns = {}
         self._history_panel = CallHistoryFrame(side)
-        self._history_panel.grid(row=3, column=0, sticky='nsew')
-        self._history_panel.grid_remove()
+        self._history_panel.set_close_callback(self._toggle_history)
+        self._history_panel.set_close_callback(self._toggle_history)
+
+
+
+    def _toggle_history(self):
+        if self._history_panel.winfo_viewable():
+            self._history_panel.pack_forget()
+            self._contacts_frame.pack(fill='both', expand=True)
+            self._hist_btn.config(text="📞 History")
+            self._close_hist_btn.pack_forget()
+        else:
+            self._contacts_frame.pack_forget()
+            self._history_panel.pack(fill='both', expand=True)
+            self._history_panel.refresh()
+            self._hist_btn.config(text="📞 History")
+            self._close_hist_btn.pack(side='left')
 
     def _make_contact_row(self, parent, c: dict) -> None:
         name      = c['name']
@@ -1160,7 +1204,7 @@ class MorseChatApp(tk.Tk):
 
         prev_strip = tk.Frame(inp, bg=BG_CARD, padx=10, pady=6,
                                highlightthickness=1, highlightbackground=BORDER)
-        prev_strip.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 10))
+        prev_strip.grid(row=0, column=0, columnspan=3, sticky='ew', pady=(0, 10))
         tk.Label(prev_strip, text='MORSE PREVIEW', font=('Helvetica', 7, 'bold'),
                  bg=BG_CARD, fg=TEXT_MORSE).pack(anchor='w')
         self.preview_var = tk.StringVar(value='start typing…')
@@ -1178,7 +1222,8 @@ class MorseChatApp(tk.Tk):
         entry.grid(row=1, column=0, sticky='ew', ipady=9, padx=(0, 10))
         entry.bind('<Return>', lambda e: self._send())
 
-        make_btn(inp, 'Send  ▶', self._send, font_size=10, pady=9, padx=18).grid(row=1, column=1)
+        make_btn(inp, '📎', self._attach_media, font_size=12, pady=9, padx=12).grid(row=1, column=1, padx=(0, 8))
+        make_btn(inp, 'Send  ▶', self._send, font_size=10, pady=9, padx=18).grid(row=1, column=2)
 
     # ── Tooltip helper ────────────────────────────────────────────────────────
 
@@ -1270,6 +1315,47 @@ class MorseChatApp(tk.Tk):
 
         threading.Thread(target=_do_send, daemon=True).start()
 
+    # ── Media attachment ──────────────────────────────────────────────────────
+
+    def _attach_media(self) -> None:
+        """Open a file picker, upload the chosen file, then send it as a message."""
+        if not self.active_contact:
+            return
+        if not _PIL_AVAILABLE:
+            messagebox.showwarning(
+                "Pillow not installed",
+                "Image support requires Pillow.\n\nRun:  pip install pillow")
+            return
+
+        path = filedialog.askopenfilename(
+            title="Choose an image or video",
+            filetypes=[
+                ("Images",    "*.png *.jpg *.jpeg *.gif *.webp"),
+                ("Videos",    "*.mp4 *.mov *.avi *.mkv *.webm"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        def _do_upload():
+            url = upload_media_to_supabase(path, self._user_id)
+            if not url:
+                self.after(0, lambda: messagebox.showerror(
+                    "Upload failed",
+                    "Could not upload the file.\n\n"
+                    "Make sure the 'ghostwire-media' bucket exists in Supabase Storage "
+                    "and is set to public."))
+                return
+            payload = MEDIA_PREFIX + url
+            send_message(self._user_id, self.active_contact["id"],
+                         morse="[media]", original=payload)
+            msgs = fetch_messages(self._user_id, self.active_contact["id"])
+            self.histories[self.active_contact["name"]] = msgs
+            self.after(0, self._redraw_messages)
+
+        threading.Thread(target=_do_upload, daemon=True).start()
+
     def _render_message(self, side: str, morse: str, original: str) -> None:
         outer = tk.Frame(self.msg_frame, bg=BG_DARK)
         outer.pack(fill='x', padx=16, pady=6)
@@ -1285,6 +1371,58 @@ class MorseChatApp(tk.Tk):
         bubble = tk.Frame(inner, bg=bubble_bg, padx=14, pady=10,
                            highlightthickness=1, highlightbackground=BORDER_LIGHT)
         bubble.pack(anchor=anchor)
+
+        # ── Media message ─────────────────────────────────────────────────────
+        if original.startswith(MEDIA_PREFIX):
+            url = original[len(MEDIA_PREFIX):]
+            ext = os.path.splitext(url.split("?")[0])[1].lower()
+            video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+            if ext in video_exts:
+                lbl = tk.Label(bubble, text="🎬  Video — click to open",
+                               font=('Helvetica', 11), bg=bubble_bg, fg=bubble_fg,
+                               cursor="hand2")
+                lbl.pack(anchor='w', pady=4)
+                lbl.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
+            else:
+                # Show a placeholder while the image downloads in the background
+                placeholder = tk.Label(bubble, text="⏳  Loading image…",
+                                       font=('Helvetica', 10), bg=bubble_bg, fg=bubble_fg)
+                placeholder.pack(anchor='w', pady=4)
+
+                def _load_image(u=url, b=bubble, ph=placeholder):
+                    try:
+                        req  = urllib.request.urlopen(u, timeout=15)
+                        data = req.read()
+                        img  = Image.open(io.BytesIO(data))
+                        img.thumbnail((300, 200))
+                        photo = ImageTk.PhotoImage(img)
+
+                        def _show(photo=photo, b=b, ph=ph, u=u):
+                            ph.destroy()
+                            img_lbl = tk.Label(b, image=photo, bg=bubble_bg, cursor="hand2")
+                            img_lbl.image = photo   # prevent garbage-collection
+                            img_lbl.pack(anchor='w', pady=4)
+                            img_lbl.bind("<Button-1>", lambda e, u=u: webbrowser.open(u))
+                            self._on_frame_configure()
+
+                        self.after(0, _show)
+                    except Exception as exc:
+                        print(f"[Media] image load failed: {exc}")
+                        self.after(0, lambda ph=ph, b=b: (
+                            ph.config(text="⚠  Could not load image")))
+
+                threading.Thread(target=_load_image, daemon=True).start()
+
+            # Timestamp only — no morse/translate for media bubbles
+            ts = time.strftime('%I:%M %p').lstrip('0')
+            meta_row = tk.Frame(inner, bg=BG_DARK)
+            meta_row.pack(fill='x', pady=(2, 0))
+            tk.Label(meta_row, text=ts, font=('Helvetica', 8),
+                     bg=BG_DARK, fg=TEXT_MORSE).pack(side='right' if side == 'sent' else 'left')
+            return  # skip normal text rendering below
+
+        # ── Text message (unchanged) ──────────────────────────────────────────
         tk.Label(bubble, text=morse, font=('Courier', 11),
                  bg=bubble_bg, fg=bubble_fg,
                  wraplength=400, justify='left').pack(anchor='w')
@@ -1366,6 +1504,14 @@ class MorseChatApp(tk.Tk):
             # 3. Open Jitsi for the caller immediately in embedded window
             call_title = f'GhostWire — {"Audio" if audio_only else "Video"} call with {their_name}'
             self.after(0, lambda: open_jitsi_window(room_url, call_title))
+            from datetime import datetime
+            from call_history_tab import history_add
+            from datetime import datetime
+            history_add(their_name, "outgoing", call_type, "answered", datetime.now(), None)
+            from datetime import datetime
+            from call_history_tab import history_add
+            from datetime import datetime
+            history_add(their_name, "outgoing", call_type, "answered", datetime.now(), None)
 
             # 4. Poll for receiver acceptance (up to 60 s)
             for _ in range(60):
