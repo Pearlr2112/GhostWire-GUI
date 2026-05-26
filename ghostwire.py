@@ -286,7 +286,7 @@ def upload_media_to_supabase(local_path: str, user_id: str) -> str | None:
     mime, _ = mimetypes.guess_type(local_path)
     mime = mime or "application/octet-stream"
 
-    remote_name = f"{user_id}/{int(time.time())}_{os.path.basename(local_path)}"
+    remote_name = f"{user_id}/{int(time.time())}_{os.path.basename(local_path).encode('ascii', 'ignore').decode('ascii').replace(' ', '_')}"
     upload_url  = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{remote_name}"
 
     storage_headers = {
